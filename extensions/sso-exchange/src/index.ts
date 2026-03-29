@@ -162,6 +162,111 @@ export default (router: Router, context: any) => {
     }
   });
 
+  // --- Web SSO callback ---
+  // After Directus SSO redirect, this endpoint reads the session cookie,
+  // generates tokens, and redirects to the web app with tokens in the URL hash.
+  router.get("/web-callback", async (req: any, res: any) => {
+    try {
+      const appUrl = req.query.app_url;
+      if (!appUrl) {
+        return res.status(400).send("app_url query parameter is required");
+      }
+
+      // Allowed web app origins
+      const allowedOrigins = (env.SSO_WEB_ALLOWED_ORIGINS || "").split(",").map((s: string) => s.trim());
+      const appOrigin = new URL(appUrl).origin;
+      if (allowedOrigins.length > 0 && allowedOrigins[0] && !allowedOrigins.includes(appOrigin)) {
+        return res.status(400).send("app_url origin not allowed");
+      }
+
+      // Read the Directus session cookie
+      const sessionCookie = req.cookies?.directus_session_token;
+      if (!sessionCookie) {
+        return res.redirect(`${appUrl}?error=no_session`);
+      }
+
+      // Decode the session JWT to get the user ID
+      const decoded = jwt.decode(sessionCookie) as { id?: string; session?: string } | null;
+      if (!decoded?.id) {
+        return res.redirect(`${appUrl}?error=invalid_session`);
+      }
+
+      const schema = await getSchema();
+      const { UsersService } = services;
+      const usersService = new UsersService({ schema, knex: database });
+      const users = await usersService.readByQuery({
+        filter: { id: { _eq: decoded.id } },
+        limit: 1,
+      });
+
+      if (!users.length) {
+        return res.redirect(`${appUrl}?error=user_not_found`);
+      }
+
+      const user = users[0];
+      const secret = env.SECRET;
+      const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
+      const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
+
+      function parseTTL(ttl: string): number {
+        const match = ttl.match(/^(\d+)([smhd])$/);
+        if (!match) return 900000;
+        const num = parseInt(match[1]);
+        const unit = match[2];
+        if (unit === "s") return num * 1000;
+        if (unit === "m") return num * 60 * 1000;
+        if (unit === "h") return num * 3600 * 1000;
+        if (unit === "d") return num * 86400 * 1000;
+        return 900000;
+      }
+
+      const sessionToken = nanoid(64);
+
+      let appAccess = true;
+      let adminAccess = false;
+      if (user.role) {
+        const role = await database("directus_roles").where({ id: user.role }).first();
+        if (role) {
+          appAccess = role.app_access ?? true;
+          adminAccess = role.admin_access ?? false;
+        }
+      }
+
+      const accessToken = jwt.sign(
+        {
+          id: user.id,
+          role: user.role ?? null,
+          app_access: appAccess,
+          admin_access: adminAccess,
+          session: sessionToken,
+        },
+        secret,
+        { expiresIn: accessTokenTTL, issuer: "directus" },
+      );
+
+      await database("directus_sessions").insert({
+        token: sessionToken,
+        user: user.id,
+        expires: new Date(Date.now() + parseTTL(sessionTTL)),
+        ip: req.ip,
+        user_agent: req.headers["user-agent"] || "sso-exchange-web",
+        origin: appOrigin,
+      });
+
+      // Redirect to web app with tokens in hash fragment (not query params, for security)
+      const params = new URLSearchParams({
+        access_token: accessToken,
+        refresh_token: sessionToken,
+        expires: String(parseTTL(accessTokenTTL)),
+      });
+
+      return res.redirect(`${appUrl}#${params.toString()}`);
+    } catch (error: any) {
+      console.error("[sso-exchange] Web callback error:", error.message);
+      return res.status(500).send("Authentication failed");
+    }
+  });
+
   // --- Login endpoint ---
   router.post("/", async (req: any, res: any) => {
     try {
