@@ -1,8 +1,12 @@
 # sso-exchange
 
-Directus endpoint extension that enables native Apple and Google Sign-In for mobile apps. Validates identity tokens directly with Apple/Google (no Keycloak or external IdP required) and returns Directus access + refresh tokens.
+Directus endpoint extension that enables native Apple/Google Sign-In for mobile apps and SSO login for web apps. Validates identity tokens directly with Apple/Google (no Keycloak or external IdP required) and returns Directus access + refresh tokens.
 
-## Endpoint
+## Endpoints
+
+### POST /sso-exchange — Native mobile login
+
+Accepts an Apple or Google identity token, validates it, and returns Directus tokens.
 
 ```
 POST /sso-exchange
@@ -14,7 +18,7 @@ Content-Type: application/json
 }
 ```
 
-### Response
+**Response:**
 
 ```json
 {
@@ -26,14 +30,62 @@ Content-Type: application/json
 }
 ```
 
+### POST /sso-exchange/refresh — Token refresh
+
+Refreshes an expired access token using the session token.
+
+```
+POST /sso-exchange/refresh
+Content-Type: application/json
+
+{
+  "refresh_token": "<session token from login>"
+}
+```
+
+**Response:** Same format as login. Session token is rotated on each refresh.
+
+### GET /sso-exchange/web-callback — Web SSO callback
+
+Used by the Directus SSO redirect flow for web apps. After Keycloak authentication, Directus redirects here with a session cookie. The endpoint generates tokens and redirects to the web app with tokens in the URL hash fragment.
+
+```
+GET /sso-exchange/web-callback?app_url=https://your-web-app.com/auth/callback
+```
+
+**Redirects to:**
+
+```
+https://your-web-app.com/auth/callback#access_token=eyJ...&refresh_token=abc...&expires=900000
+```
+
 ## How it works
 
-1. Receives a native identity token from the mobile app
-2. **Apple**: Verifies the JWT signature against Apple's JWKS (`https://appleid.apple.com/auth/keys`)
-3. **Google**: Validates the token via Google's tokeninfo endpoint with audience check
-4. Finds an existing Directus user by email, or creates a new one
-5. Signs a Directus-compatible JWT and creates a session
-6. Returns access token + refresh token to the app
+### Mobile (iOS / Android)
+
+```
+User taps "Continue with Apple/Google"
+  → Native SDK returns identity token
+  → App calls POST /sso-exchange { token, issuer }
+  → Extension verifies token with Apple JWKS / Google tokeninfo
+  → Finds or creates Directus user
+  → Returns Directus access + refresh tokens
+```
+
+### Web (Expo Web / React)
+
+```
+User clicks "Sign In"
+  → Browser redirects to Directus SSO URL:
+    /auth/login/keycloak?redirect=/sso-exchange/web-callback?app_url=...
+  → Keycloak login page
+  → User authenticates
+  → Directus sets session cookie, redirects to /sso-exchange/web-callback
+  → Extension reads session cookie, generates tokens
+  → Redirects to web app with tokens in URL hash:
+    https://your-app.com/auth/callback#access_token=...&refresh_token=...
+  → Web app reads hash, stores tokens
+```
 
 ## Environment variables
 
@@ -42,8 +94,10 @@ Set these in your Directus deployment:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SECRET` | Yes | Directus secret (already set in Directus) |
-| `SSO_GOOGLE_CLIENT_ID` | Yes | Google Web Client ID for audience validation |
+| `SSO_GOOGLE_CLIENT_ID` | For Google | Google Web Client ID for audience validation |
 | `SSO_DEFAULT_ROLE_ID` | No | Directus role ID assigned to new users |
+| `SSO_WEB_ALLOWED_ORIGINS` | For web | Comma-separated allowed web app origins (e.g. `http://localhost:8081,https://app.example.com`) |
+| `AUTH_KEYCLOAK_REDIRECT_ALLOW_LIST` | For web | Must include the web-callback URL: `https://<DIRECTUS>/sso-exchange/web-callback` |
 | `ACCESS_TOKEN_TTL` | No | Access token TTL (default: `15m`) |
 | `REFRESH_TOKEN_TTL` | No | Session TTL (default: `7d`) |
 
@@ -69,6 +123,8 @@ initContainers:
         mountPath: /extensions
 ```
 
+Mount the shared volume in the Directus container at `/directus/extensions`.
+
 ### Option 2: Docker volume mount
 
 ```bash
@@ -85,26 +141,75 @@ COPY dist/index.js /directus/extensions/sso-exchange/dist/index.js
 COPY package.json /directus/extensions/sso-exchange/package.json
 ```
 
-## Mobile app integration
+## Client integration
+
+### Mobile — Native Apple Sign-In (iOS)
 
 ```ts
-// Native Apple Sign-In
-const credential = await AppleAuthentication.signInAsync({ ... });
+import * as AppleAuthentication from "expo-apple-authentication";
+
+const credential = await AppleAuthentication.signInAsync({
+  requestedScopes: [
+    AppleAuthentication.AppleAuthenticationScope.EMAIL,
+    AppleAuthentication.AppleAuthenticationScope.FULL_NAME,
+  ],
+});
+
 const res = await fetch(`${DIRECTUS_URL}/sso-exchange`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ token: credential.identityToken, issuer: "apple" }),
 });
+
 const { data } = await res.json();
 // data.access_token, data.refresh_token, data.expires
+```
 
-// Native Google Sign-In
+### Mobile — Native Google Sign-In (Android)
+
+```ts
+import { GoogleSignin } from "@react-native-google-signin/google-signin";
+
 const response = await GoogleSignin.signIn();
 const res = await fetch(`${DIRECTUS_URL}/sso-exchange`, {
   method: "POST",
   headers: { "Content-Type": "application/json" },
   body: JSON.stringify({ token: response.data.idToken, issuer: "google" }),
 });
+
+const { data } = await res.json();
+```
+
+### Web — Directus SSO redirect (Expo Web / React)
+
+```ts
+// 1. Redirect to Directus SSO (login.tsx)
+const callbackUrl = `${DIRECTUS_URL}/sso-exchange/web-callback?app_url=${encodeURIComponent(window.location.origin + "/auth/callback")}`;
+const ssoUrl = `${DIRECTUS_URL}/auth/login/keycloak?redirect=${encodeURIComponent(callbackUrl)}`;
+window.location.href = ssoUrl;
+
+// 2. Handle callback (auth/callback.tsx)
+const hash = window.location.hash.substring(1);
+const params = new URLSearchParams(hash);
+const tokens = {
+  access_token: params.get("access_token"),
+  refresh_token: params.get("refresh_token"),
+  expires: Number(params.get("expires")),
+};
+// Store tokens and redirect to app
+```
+
+### Token refresh (all platforms)
+
+```ts
+const res = await fetch(`${DIRECTUS_URL}/sso-exchange/refresh`, {
+  method: "POST",
+  headers: { "Content-Type": "application/json" },
+  body: JSON.stringify({ refresh_token: storedRefreshToken }),
+});
+
+const { data } = await res.json();
+// data.access_token (new), data.refresh_token (rotated), data.expires
 ```
 
 ## Build
