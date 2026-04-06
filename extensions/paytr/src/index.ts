@@ -1,14 +1,24 @@
 import type { Router } from "express";
 import crypto from "crypto";
-import express from "express";
+import querystring from "querystring";
 
 export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
 
   // Parse URL-encoded bodies (PayTR sends callbacks as application/x-www-form-urlencoded)
-  // Must be placed before routes - Directus only parses JSON by default
-  router.use(express.urlencoded({ extended: true }));
-  router.use(express.json());
+  // Directus only parses JSON by default
+  router.use((req: any, _res: any, next: any) => {
+    if (req.headers["content-type"]?.includes("x-www-form-urlencoded") && (!req.body || Object.keys(req.body).length === 0)) {
+      const chunks: Buffer[] = [];
+      req.on("data", (chunk: Buffer) => chunks.push(chunk));
+      req.on("end", () => {
+        req.body = querystring.parse(Buffer.concat(chunks).toString());
+        next();
+      });
+    } else {
+      next();
+    }
+  });
 
   // ─── GET TOKEN ───────────────────────────────────────────────
   router.post("/get-token", async (req: any, res: any) => {
