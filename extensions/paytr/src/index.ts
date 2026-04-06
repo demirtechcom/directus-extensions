@@ -1,8 +1,12 @@
 import type { Router } from "express";
 import crypto from "crypto";
+import express from "express";
 
 export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
+
+  // Parse URL-encoded bodies (PayTR sends callbacks as application/x-www-form-urlencoded)
+  router.use(express.urlencoded({ extended: false }));
 
   // ─── GET TOKEN ───────────────────────────────────────────────
   router.post("/get-token", async (req: any, res: any) => {
