@@ -6,7 +6,9 @@ export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
 
   // Parse URL-encoded bodies (PayTR sends callbacks as application/x-www-form-urlencoded)
-  router.use(express.urlencoded({ extended: false }));
+  // Must be placed before routes - Directus only parses JSON by default
+  router.use(express.urlencoded({ extended: true }));
+  router.use(express.json());
 
   // ─── GET TOKEN ───────────────────────────────────────────────
   router.post("/get-token", async (req: any, res: any) => {
@@ -131,8 +133,8 @@ export default (router: Router, context: any) => {
   // ─── CALLBACK ────────────────────────────────────────────────
   router.post("/callback", async (req: any, res: any) => {
     try {
-      console.log("[paytr] callback raw body:", JSON.stringify(req.body), "content-type:", req.headers["content-type"]);
       const body = req.body || {};
+      console.log("[paytr] callback body:", JSON.stringify(body));
       const { merchant_oid, status, total_amount, hash, payment_type, failed_reason_msg } = body;
 
       if (!merchant_oid || !status || !hash) return res.send("OK");
