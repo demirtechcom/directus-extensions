@@ -17,7 +17,7 @@ export default (router: Router, context: any) => {
       const usersService = new services.UsersService({ schema, accountability: { admin: true } });
       const itemsService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
 
-      const user = await usersService.readOne(userId, { fields: ["email"] });
+      const user = await usersService.readOne(userId, { fields: ["email", "first_name", "last_name"] });
       const plan = await itemsService.readOne(planId, { fields: ["name", "paytr_price_kurus"] });
 
       if (!plan?.paytr_price_kurus) {
@@ -68,6 +68,8 @@ export default (router: Router, context: any) => {
         crypto.createHmac("sha256", merchantKey).update(hashStr).digest(),
       ).toString("base64");
 
+      const userName = [user.first_name, user.last_name].filter(Boolean).join(" ") || "Kullanici";
+
       // Request iframe token from PayTR
       const params = new URLSearchParams({
         merchant_id: merchantId,
@@ -82,6 +84,9 @@ export default (router: Router, context: any) => {
         max_installment: String(maxInstallment),
         currency,
         test_mode: testMode,
+        user_name: userName,
+        user_address: "N/A",
+        user_phone: "N/A",
         merchant_ok_url: okUrl,
         merchant_fail_url: failUrl,
         merchant_notify_url: callbackUrl,
