@@ -230,4 +230,17 @@ export default (router: Router, context: any) => {
       return res.send("OK");
     }
   });
+
+  // ─── REDIRECT ────────────────────────────────────────────────
+  // GET /paytr/ok  — PayTR redirects user here after successful payment
+  // GET /paytr/fail — PayTR redirects user here after failed payment
+  router.get("/ok", (_req: any, res: any) => {
+    const appUrl = String(env["PAYTR_APP_URL"] || "http://localhost:8081");
+    return res.redirect(`${appUrl}/paywall?status=ok`);
+  });
+
+  router.get("/fail", (_req: any, res: any) => {
+    const appUrl = String(env["PAYTR_APP_URL"] || "http://localhost:8081");
+    return res.redirect(`${appUrl}/paywall?status=fail`);
+  });
 };
