@@ -127,6 +127,7 @@ export default (router: Router, context: any) => {
   // ─── CALLBACK ────────────────────────────────────────────────
   router.post("/callback", async (req: any, res: any) => {
     try {
+      console.log("[paytr] callback raw body:", JSON.stringify(req.body), "content-type:", req.headers["content-type"]);
       const body = req.body || {};
       const { merchant_oid, status, total_amount, hash, payment_type, failed_reason_msg } = body;
 
