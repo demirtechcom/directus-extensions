@@ -144,7 +144,7 @@ export default (router: Router, context: any) => {
       ).toString("base64");
 
       if (hash !== expectedHash) {
-        console.error("[paytr] Hash mismatch for", merchant_oid);
+        console.error("[paytr] Hash mismatch for", merchant_oid, "received:", hash, "expected:", expectedHash, "key_len:", merchantKey.length, "salt_len:", merchantSalt.length);
         return res.send("OK");
       }
 
@@ -165,8 +165,17 @@ export default (router: Router, context: any) => {
         limit: 1,
       });
 
+      console.log("[paytr] callback received:", merchant_oid, "status:", status, "found payments:", payments.length);
+
       const payment = payments[0];
-      if (!payment || payment.payment_status !== "pending") return res.send("OK");
+      if (!payment) {
+        console.error("[paytr] No payment record found for", merchant_oid);
+        return res.send("OK");
+      }
+      if (payment.payment_status !== "pending") {
+        console.log("[paytr] Payment already processed:", merchant_oid, payment.payment_status);
+        return res.send("OK");
+      }
 
       if (status === "success") {
         // Update payment record with card tokens
