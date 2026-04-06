@@ -40,7 +40,7 @@ export default (router: Router, context: any) => {
       const userIp = (req.headers["x-forwarded-for"] || req.headers["x-real-ip"] || req.ip || "127.0.0.1")
         .split(",")[0]
         .trim();
-      const merchantOid = "DLVR-" + userId.slice(0, 8) + "-" + Date.now();
+      const merchantOid = "DLVR" + userId.replace(/-/g, "").slice(0, 8) + Date.now();
       const paymentAmount = plan.paytr_price_kurus;
       const currency = "TL";
       const noInstallment = 1;
