@@ -7,6 +7,7 @@ Open-source Directus extensions by [DemirTech](https://demirtech.com).
 | Extension | Type | Description |
 |-----------|------|-------------|
 | [sso-exchange](extensions/sso-exchange/) | Endpoint | Native Apple & Google Sign-In for mobile apps |
+| [paytr](extensions/paytr/) | Endpoint | PayTR payment integration (iFrame API + webhook callback) |
 
 ## Usage with Kubernetes
 
@@ -20,11 +21,15 @@ initContainers:
       - sh
       - -c
       - |
-        mkdir -p /extensions/sso-exchange/dist
+        mkdir -p /extensions/sso-exchange/dist /extensions/paytr/dist
         wget -O /extensions/sso-exchange/dist/index.js \
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/sso-exchange/dist/index.js"
         wget -O /extensions/sso-exchange/package.json \
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/sso-exchange/package.json"
+        wget -O /extensions/paytr/dist/index.js \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/paytr/dist/index.js"
+        wget -O /extensions/paytr/package.json \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/paytr/package.json"
     volumeMounts:
       - name: extensions
         mountPath: /extensions
