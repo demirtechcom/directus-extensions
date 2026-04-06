@@ -1,24 +1,8 @@
 import type { Router } from "express";
 import crypto from "crypto";
-import querystring from "querystring";
 
 export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
-
-  // Parse URL-encoded bodies (PayTR sends callbacks as application/x-www-form-urlencoded)
-  // Directus only parses JSON by default
-  router.use((req: any, _res: any, next: any) => {
-    if (req.headers["content-type"]?.includes("x-www-form-urlencoded") && (!req.body || Object.keys(req.body).length === 0)) {
-      const chunks: Buffer[] = [];
-      req.on("data", (chunk: Buffer) => chunks.push(chunk));
-      req.on("end", () => {
-        req.body = querystring.parse(Buffer.concat(chunks).toString());
-        next();
-      });
-    } else {
-      next();
-    }
-  });
 
   // ─── GET TOKEN ───────────────────────────────────────────────
   router.post("/get-token", async (req: any, res: any) => {
@@ -31,10 +15,10 @@ export default (router: Router, context: any) => {
 
       const schema = await getSchema();
       const usersService = new services.UsersService({ schema, accountability: { admin: true } });
-      const itemsService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
+      const plansService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
 
       const user = await usersService.readOne(userId, { fields: ["email", "first_name", "last_name"] });
-      const plan = await itemsService.readOne(planId, { fields: ["name", "paytr_price_kurus"] });
+      const plan = await plansService.readOne(planId, { fields: ["name", "paytr_price_kurus"] });
 
       if (!plan?.paytr_price_kurus) {
         return res.status(400).json({ error: "Invalid plan" });
@@ -49,7 +33,7 @@ export default (router: Router, context: any) => {
       const failUrl = String(env["PAYTR_FAIL_URL"] || "");
 
       if (!merchantId || !merchantKey || !merchantSalt) {
-        console.error("[paytr] Missing PAYTR_MERCHANT_ID, PAYTR_MERCHANT_KEY, or PAYTR_MERCHANT_SALT");
+        console.error("[paytr] Missing merchant credentials");
         return res.status(500).json({ error: "Payment service not configured" });
       }
 
@@ -63,30 +47,17 @@ export default (router: Router, context: any) => {
       const maxInstallment = 0;
 
       const priceStr = (paymentAmount / 100).toFixed(2);
-      const userBasket = Buffer.from(
-        JSON.stringify([[plan.name, priceStr, 1]]),
-      ).toString("base64");
+      const userBasket = Buffer.from(JSON.stringify([[plan.name, priceStr, 1]])).toString("base64");
 
-      // Build HMAC-SHA256 token
       const hashStr =
-        merchantId +
-        userIp +
-        merchantOid +
-        user.email +
-        paymentAmount +
-        userBasket +
-        noInstallment +
-        maxInstallment +
-        currency +
-        testMode +
-        merchantSalt;
+        merchantId + userIp + merchantOid + user.email + paymentAmount +
+        userBasket + noInstallment + maxInstallment + currency + testMode + merchantSalt;
       const paytrToken = Buffer.from(
         crypto.createHmac("sha256", merchantKey).update(hashStr).digest(),
       ).toString("base64");
 
       const userName = [user.first_name, user.last_name].filter(Boolean).join(" ") || "Kullanici";
 
-      // Request iframe token from PayTR
       const params = new URLSearchParams({
         merchant_id: merchantId,
         user_ip: userIp,
@@ -120,11 +91,7 @@ export default (router: Router, context: any) => {
         return res.status(400).json({ error: "Payment provider error" });
       }
 
-      // Create pending payment record
-      const paymentsService = new services.ItemsService("paytr_payments", {
-        schema,
-        accountability: { admin: true },
-      });
+      const paymentsService = new services.ItemsService("paytr_payments", { schema, accountability: { admin: true } });
       await paymentsService.createOne({
         user_id: userId,
         plan_id: planId,
@@ -140,62 +107,125 @@ export default (router: Router, context: any) => {
     }
   });
 
+  // ─── CHECK STATUS ────────────────────────────────────────────
+  // GET /paytr/check-status?merchant_oid=DLVR...
+  // Queries PayTR Status Inquiry API and updates payment record
+  router.get("/check-status", async (req: any, res: any) => {
+    try {
+      const userId = req.accountability?.user;
+      if (!userId) return res.status(401).json({ error: "Authentication required" });
+
+      const merchantOid = req.query.merchant_oid;
+      if (!merchantOid) return res.status(400).json({ error: "merchant_oid is required" });
+
+      const merchantId = String(env["PAYTR_MERCHANT_ID"] || "");
+      const merchantKey = String(env["PAYTR_MERCHANT_KEY"] || "");
+      const merchantSalt = String(env["PAYTR_MERCHANT_SALT"] || "");
+
+      // Query PayTR Status Inquiry API
+      const hashStr = merchantId + merchantOid + merchantSalt;
+      const paytrToken = Buffer.from(
+        crypto.createHmac("sha256", merchantKey).update(hashStr).digest(),
+      ).toString("base64");
+
+      const statusRes = await fetch("https://www.paytr.com/odeme/durum-sorgu", {
+        method: "POST",
+        headers: { "Content-Type": "application/x-www-form-urlencoded" },
+        body: new URLSearchParams({
+          merchant_id: merchantId,
+          merchant_oid: merchantOid,
+          merchant_key: merchantKey,
+          merchant_salt: merchantSalt,
+          paytr_token: paytrToken,
+        }).toString(),
+      }).then((r) => r.json() as Promise<any>);
+
+      console.log("[paytr] status inquiry for", merchantOid, ":", statusRes.status);
+
+      if (statusRes.status === "success") {
+        // Payment confirmed by PayTR — update our records
+        const schema = await getSchema();
+        const paymentsService = new services.ItemsService("paytr_payments", { schema, accountability: { admin: true } });
+
+        const payments = await paymentsService.readByQuery({
+          filter: { merchant_oid: { _eq: merchantOid } },
+          fields: ["id", "user_id", "plan_id", "payment_status"],
+          limit: 1,
+        });
+
+        const payment = payments[0];
+        if (payment && payment.payment_status === "pending") {
+          // Update payment
+          await paymentsService.updateOne(payment.id, {
+            payment_status: "success",
+            payment_type: statusRes.odeme_tipi || "card",
+          });
+
+          // Activate subscription
+          const usersService = new services.UsersService({ schema, accountability: { admin: true } });
+          await usersService.updateOne(payment.user_id, {
+            subscription_tier: "pro",
+            subscription_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
+          });
+
+          console.log("[paytr] Payment activated via status check:", merchantOid);
+        }
+
+        return res.json({ payment_status: "success" });
+      }
+
+      return res.json({ payment_status: "pending" });
+    } catch (err: any) {
+      console.error("[paytr] check-status error:", err.message);
+      return res.status(500).json({ error: "Status check failed" });
+    }
+  });
+
   // ─── CALLBACK ────────────────────────────────────────────────
+  // PayTR POSTs payment result here (application/x-www-form-urlencoded)
+  // Note: Directus only parses JSON bodies, so urlencoded body may be empty.
+  // The check-status endpoint above is the reliable fallback.
   router.post("/callback", async (req: any, res: any) => {
     try {
       const body = req.body || {};
-      console.log("[paytr] callback body:", JSON.stringify(body));
+
       const { merchant_oid, status, total_amount, hash, payment_type, failed_reason_msg } = body;
 
-      if (!merchant_oid || !status || !hash) return res.send("OK");
+      if (!merchant_oid || !status || !hash) {
+        // Body wasn't parsed (urlencoded issue) — PayTR will retry.
+        // The check-status endpoint handles verification as fallback.
+        console.log("[paytr] callback body empty or unparsed, PayTR will retry");
+        return res.send("OK");
+      }
 
       const merchantKey = String(env["PAYTR_MERCHANT_KEY"] || "");
       const merchantSalt = String(env["PAYTR_MERCHANT_SALT"] || "");
 
-      // Verify hash
       const expectedHash = Buffer.from(
-        crypto
-          .createHmac("sha256", merchantKey)
+        crypto.createHmac("sha256", merchantKey)
           .update(merchant_oid + merchantSalt + status + total_amount)
           .digest(),
       ).toString("base64");
 
       if (hash !== expectedHash) {
-        console.error("[paytr] Hash mismatch for", merchant_oid, "received:", hash, "expected:", expectedHash, "key_len:", merchantKey.length, "salt_len:", merchantSalt.length);
+        console.error("[paytr] Hash mismatch for", merchant_oid);
         return res.send("OK");
       }
 
       const schema = await getSchema();
-      const paymentsService = new services.ItemsService("paytr_payments", {
-        schema,
-        accountability: { admin: true },
-      });
-      const usersService = new services.UsersService({
-        schema,
-        accountability: { admin: true },
-      });
+      const paymentsService = new services.ItemsService("paytr_payments", { schema, accountability: { admin: true } });
+      const usersService = new services.UsersService({ schema, accountability: { admin: true } });
 
-      // Find payment record
       const payments = await paymentsService.readByQuery({
         filter: { merchant_oid: { _eq: merchant_oid } },
         fields: ["id", "user_id", "plan_id", "payment_status"],
         limit: 1,
       });
 
-      console.log("[paytr] callback received:", merchant_oid, "status:", status, "found payments:", payments.length);
-
       const payment = payments[0];
-      if (!payment) {
-        console.error("[paytr] No payment record found for", merchant_oid);
-        return res.send("OK");
-      }
-      if (payment.payment_status !== "pending") {
-        console.log("[paytr] Payment already processed:", merchant_oid, payment.payment_status);
-        return res.send("OK");
-      }
+      if (!payment || payment.payment_status !== "pending") return res.send("OK");
 
       if (status === "success") {
-        // Update payment record with card tokens
         await paymentsService.updateOne(payment.id, {
           payment_status: "success",
           payment_type: payment_type || null,
@@ -203,7 +233,6 @@ export default (router: Router, context: any) => {
           ctoken: body.ctoken || null,
         });
 
-        // Store card tokens on user for recurring billing
         const userUpdate: Record<string, any> = {
           subscription_tier: "pro",
           subscription_expires_at: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000).toISOString(),
@@ -212,36 +241,7 @@ export default (router: Router, context: any) => {
         if (body.ctoken) userUpdate.paytr_ctoken = body.ctoken;
 
         await usersService.updateOne(payment.user_id, userUpdate);
-
-        // Update subscription record if exists
-        const subsService = new services.ItemsService("subscriptions", {
-          schema,
-          accountability: { admin: true },
-        });
-        const subs = await subsService.readByQuery({
-          filter: {
-            _and: [
-              { venue_id: { user_created: { _eq: payment.user_id } } },
-              { subscription_status: { _in: ["active", "trial"] } },
-            ],
-          },
-          fields: ["id"],
-          limit: 1,
-        });
-
-        if (subs[0]) {
-          const endDate = new Date(Date.now() + 30 * 24 * 60 * 60 * 1000)
-            .toISOString()
-            .split("T")[0];
-          await subsService.updateOne(subs[0].id, {
-            subscription_status: "active",
-            plan_id: payment.plan_id,
-            end_date: endDate,
-            auto_renew: true,
-          });
-        }
-
-        console.log("[paytr] Payment success:", merchant_oid);
+        console.log("[paytr] Payment success via callback:", merchant_oid);
       } else {
         await paymentsService.updateOne(payment.id, {
           payment_status: "failed",
@@ -258,8 +258,6 @@ export default (router: Router, context: any) => {
   });
 
   // ─── REDIRECT ────────────────────────────────────────────────
-  // GET /paytr/ok  — PayTR redirects user here after successful payment
-  // GET /paytr/fail — PayTR redirects user here after failed payment
   router.get("/ok", (_req: any, res: any) => {
     const appUrl = String(env["PAYTR_APP_URL"] || "http://localhost:8081");
     return res.redirect(`${appUrl}/paywall?status=ok`);
