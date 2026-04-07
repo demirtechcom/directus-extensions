@@ -65,7 +65,11 @@ async function verifyGoogleToken(
 // --- Extension ---
 
 export default (router: Router, context: any) => {
-  const { services, getSchema, database, env } = context;
+  const { services, getSchema, database, env, logger } = context;
+
+  const rawOrigins = env.SSO_WEB_ALLOWED_ORIGINS || "";
+  const allowedOrigins = (Array.isArray(rawOrigins) ? rawOrigins : rawOrigins.split(",")).map((s: string) => s.trim()).filter(Boolean);
+  logger.info(`[sso-exchange] SSO_WEB_ALLOWED_ORIGINS type=${typeof rawOrigins} isArray=${Array.isArray(rawOrigins)} raw=${JSON.stringify(rawOrigins)} parsed=${JSON.stringify(allowedOrigins)}`);
 
   // --- Refresh endpoint ---
   router.post("/refresh", async (req: any, res: any) => {
@@ -173,9 +177,8 @@ export default (router: Router, context: any) => {
       }
 
       // Allowed web app origins
-      const allowedOrigins = (env.SSO_WEB_ALLOWED_ORIGINS || "").split(",").map((s: string) => s.trim());
       const appOrigin = new URL(appUrl).origin;
-      if (allowedOrigins.length > 0 && allowedOrigins[0] && !allowedOrigins.includes(appOrigin)) {
+      if (allowedOrigins.length > 0 && !allowedOrigins.includes(appOrigin)) {
         return res.status(400).send("app_url origin not allowed");
       }
 
