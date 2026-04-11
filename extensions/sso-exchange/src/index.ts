@@ -270,10 +270,48 @@ export default (router: Router, context: any) => {
     }
   });
 
+  // --- Logout endpoint ---
+  // Clears the Directus session cookie and redirects to Keycloak logout
+  router.get("/logout", (req: any, res: any) => {
+    const redirectUrl = req.query.redirect_url;
+    if (!redirectUrl) {
+      return res.status(400).json({ errors: [{ message: "redirect_url is required" }] });
+    }
+
+    // Validate redirect URL origin
+    try {
+      const origin = new URL(redirectUrl).origin;
+      if (allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
+        return res.status(400).json({ errors: [{ message: "redirect_url origin not allowed" }] });
+      }
+    } catch {
+      return res.status(400).json({ errors: [{ message: "Invalid redirect_url" }] });
+    }
+
+    // Clear the Directus session cookie
+    res.clearCookie("directus_session_token", { path: "/" });
+
+    // Redirect to Keycloak OIDC logout to end the SSO session
+    const keycloakIssuerRaw = env.AUTH_KEYCLOAK_ISSUER_URL || "";
+    const keycloakIssuer = keycloakIssuerRaw.replace(/\/\.well-known\/openid-configuration$/, "");
+    const keycloakClientId = env.AUTH_KEYCLOAK_CLIENT_ID;
+
+    if (!keycloakIssuer || !keycloakClientId) {
+      // Keycloak not configured — just redirect back
+      return res.redirect(redirectUrl);
+    }
+
+    const logoutUrl = new URL(`${keycloakIssuer}/protocol/openid-connect/logout`);
+    logoutUrl.searchParams.set("post_logout_redirect_uri", redirectUrl);
+    logoutUrl.searchParams.set("client_id", keycloakClientId);
+
+    return res.redirect(logoutUrl.toString());
+  });
+
   // --- Login endpoint ---
   router.post("/", async (req: any, res: any) => {
     try {
-      const { token, issuer } = req.body;
+      const { token, issuer, given_name: clientGivenName, family_name: clientFamilyName } = req.body;
 
       if (!token || !issuer) {
         return res.status(400).json({
@@ -297,6 +335,9 @@ export default (router: Router, context: any) => {
 
       if (issuer === "apple") {
         userinfo = await verifyAppleToken(token);
+        // Apple JWT doesn't include names — use client-provided values
+        if (clientGivenName) userinfo.given_name = clientGivenName;
+        if (clientFamilyName) userinfo.family_name = clientFamilyName;
       } else {
         const googleAudience = env.SSO_GOOGLE_CLIENT_ID || "";
         userinfo = await verifyGoogleToken(token, googleAudience);
@@ -316,6 +357,15 @@ export default (router: Router, context: any) => {
 
       if (users.length > 0) {
         userId = users[0].id;
+
+        // Update name if currently missing and provider gives us one
+        const existing = users[0];
+        const nameUpdate: Record<string, string> = {};
+        if (!existing.first_name && userinfo.given_name) nameUpdate.first_name = userinfo.given_name;
+        if (!existing.last_name && userinfo.family_name) nameUpdate.last_name = userinfo.family_name;
+        if (Object.keys(nameUpdate).length > 0) {
+          await usersService.updateOne(userId, nameUpdate);
+        }
       } else {
         const roleId = env.SSO_DEFAULT_ROLE_ID || null;
         userId = await usersService.createOne({
