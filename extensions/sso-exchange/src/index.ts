@@ -270,6 +270,55 @@ export default (router: Router, context: any) => {
     }
   });
 
+  // --- Delete account endpoint ---
+  router.delete("/delete-account", async (req: any, res: any) => {
+    try {
+      const authHeader = req.headers["authorization"];
+      if (!authHeader?.startsWith("Bearer ")) {
+        return res.status(401).json({ errors: [{ message: "Authorization header required" }] });
+      }
+      const token = authHeader.slice(7);
+
+      const secret = env.SECRET;
+      let decoded: { id?: string };
+      try {
+        decoded = jwt.verify(token, secret, { issuer: "directus" }) as { id?: string };
+      } catch {
+        return res.status(401).json({ errors: [{ message: "Invalid or expired token" }] });
+      }
+
+      if (!decoded?.id) {
+        return res.status(401).json({ errors: [{ message: "Invalid token payload" }] });
+      }
+
+      const schema = await getSchema();
+      const { UsersService } = services;
+      const usersService = new UsersService({ schema, knex: database });
+
+      // Verify user exists before deletion
+      const users = await usersService.readByQuery({
+        filter: { id: { _eq: decoded.id } },
+        limit: 1,
+      });
+
+      if (!users.length) {
+        return res.status(404).json({ errors: [{ message: "User not found" }] });
+      }
+
+      // Delete user sessions
+      await database("directus_sessions").where({ user: decoded.id }).del();
+
+      // Delete user (Directus handles cascading relations)
+      await usersService.deleteOne(decoded.id);
+
+      logger.info(`[sso-exchange] User ${decoded.id} deleted their account`);
+      return res.json({ data: { success: true } });
+    } catch (error: any) {
+      logger.error(`[sso-exchange] Delete account error: ${error.message}`);
+      return res.status(500).json({ errors: [{ message: "Account deletion failed" }] });
+    }
+  });
+
   // --- Logout endpoint ---
   // Clears the Directus session cookie and redirects to Keycloak logout
   router.get("/logout", (req: any, res: any) => {
