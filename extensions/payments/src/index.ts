@@ -17,6 +17,12 @@ function getClientIp(req: any): string {
 export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
 
+  // Plan adına göre atanacak Directus role ID'si.
+  // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
+  const PLAN_ROLE_MAP: Record<string, string> = {
+    "Customer Pro": String(env["BUSINESS_ROLE_ID"] || ""),
+  };
+
   // --- Shared helpers ---
 
   function getPayTRConfig() {
@@ -42,6 +48,7 @@ export default (router: Router, context: any) => {
     const schema = await getSchema();
     const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
     const usersService = new services.UsersService({ schema, accountability: { admin: true } });
+    const plansService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
 
     await paymentsService.updateOne(paymentId, {
       payment_status: "success",
@@ -56,6 +63,13 @@ export default (router: Router, context: any) => {
     };
     if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
     if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
+
+    const plan = await plansService.readOne(planId, { fields: ["name"] });
+    const targetRoleId = plan?.name ? PLAN_ROLE_MAP[plan.name] : "";
+    if (targetRoleId) {
+      userUpdate.role = targetRoleId;
+      console.log("[payments] role updated", { userId, planName: plan.name, toRole: targetRoleId });
+    }
 
     await usersService.updateOne(userId, userUpdate);
   }
