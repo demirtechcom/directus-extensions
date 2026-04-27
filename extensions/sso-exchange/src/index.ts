@@ -271,6 +271,9 @@ export default (router: Router, context: any) => {
   });
 
   // --- Delete account endpoint ---
+  // Soft-delete: archives the user record and clears personal data, anonymizes
+  // operational/financial records (user_id=NULL), and hard-deletes purely
+  // behavioral data. Audit/legal trail is preserved.
   router.delete("/delete-account", async (req: any, res: any) => {
     try {
       const authHeader = req.headers["authorization"];
@@ -291,28 +294,73 @@ export default (router: Router, context: any) => {
         return res.status(401).json({ errors: [{ message: "Invalid token payload" }] });
       }
 
-      const schema = await getSchema();
-      const { UsersService } = services;
-      const usersService = new UsersService({ schema, knex: database });
-
-      // Verify user exists before deletion
-      const users = await usersService.readByQuery({
-        filter: { id: { _eq: decoded.id } },
-        limit: 1,
-      });
-
-      if (!users.length) {
-        return res.status(404).json({ errors: [{ message: "User not found" }] });
+      const userId = decoded.id;
+      const user = await database("directus_users").where({ id: userId }).first();
+      if (!user) {
+        return res.status(404).json({ status: "not_found" });
       }
 
-      // Delete user sessions
-      await database("directus_sessions").where({ user: decoded.id }).del();
+      // Idempotency: already archived
+      if (user.status === "archived") {
+        return res.json({ status: "deleted" });
+      }
 
-      // Delete user (Directus handles cascading relations)
-      await usersService.deleteOne(decoded.id);
+      // Operational/financial records — keep but break the personal link
+      const ANONYMIZE_TABLES: { table: string; column: string }[] = [
+        { table: "orders", column: "user_id" },
+        { table: "table_reservations", column: "user_id" },
+        { table: "product_reservations", column: "user_id" },
+        { table: "payments", column: "user_id" },
+        { table: "complaints", column: "user_id" },
+        { table: "campaigns", column: "created_by" },
+        { table: "venues", column: "user_created" },
+      ];
 
-      logger.info(`[sso-exchange] User ${decoded.id} deleted their account`);
-      return res.json({ data: { success: true } });
+      // Behavioral / personal data — drop entirely
+      const HARD_DELETE_TABLES: { table: string; column: string }[] = [
+        { table: "favorites", column: "user_id" },
+        { table: "venue_follows", column: "user_id" },
+        { table: "food_type_follows", column: "user_id" },
+        { table: "venue_view_logs", column: "user_id" },
+        { table: "campaign_analytics", column: "user_id" },
+        { table: "notifications", column: "user_id" },
+        { table: "business_notification_logs", column: "user_id" },
+        { table: "user_district_filters", column: "user_id" },
+        { table: "push_tokens", column: "user_id" },
+      ];
+
+      await database.transaction(async (trx) => {
+        await trx("directus_sessions").where({ user: userId }).del();
+
+        for (const { table, column } of ANONYMIZE_TABLES) {
+          await trx(table).where({ [column]: userId }).update({ [column]: null });
+        }
+
+        for (const { table, column } of HARD_DELETE_TABLES) {
+          await trx(table).where({ [column]: userId }).del();
+        }
+
+        // Soft-delete the user record itself: clear personal data, archive status.
+        // external_identifier=null ensures the same SSO account creates a fresh user on re-login.
+        await trx("directus_users")
+          .where({ id: userId })
+          .update({
+            status: "archived",
+            email: `deleted_${userId}@deleted.local`,
+            first_name: null,
+            last_name: null,
+            avatar: null,
+            phone: null,
+            external_identifier: null,
+            subscription_tier: "free",
+            subscription_expires_at: null,
+            stored_card_user_token: null,
+            stored_card_token: null,
+          });
+      });
+
+      logger.info(`[sso-exchange] User ${userId} soft-deleted their account`);
+      return res.json({ status: "deleted" });
     } catch (error: any) {
       logger.error(`[sso-exchange] Delete account error: ${error.message}`);
       return res.status(500).json({ errors: [{ message: "Account deletion failed" }] });
