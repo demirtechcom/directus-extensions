@@ -305,57 +305,18 @@ export default (router: Router, context: any) => {
         return res.json({ status: "deleted" });
       }
 
-      // Operational/financial records — keep but break the personal link
-      const ANONYMIZE_TABLES: { table: string; column: string }[] = [
-        { table: "orders", column: "user_id" },
-        { table: "table_reservations", column: "user_id" },
-        { table: "product_reservations", column: "user_id" },
-        { table: "payments", column: "user_id" },
-        { table: "complaints", column: "user_id" },
-        { table: "campaigns", column: "created_by" },
-        { table: "venues", column: "user_created" },
-      ];
-
-      // Behavioral / personal data — drop entirely
-      const HARD_DELETE_TABLES: { table: string; column: string }[] = [
-        { table: "favorites", column: "user_id" },
-        { table: "venue_follows", column: "user_id" },
-        { table: "food_type_follows", column: "user_id" },
-        { table: "venue_view_logs", column: "user_id" },
-        { table: "campaign_analytics", column: "user_id" },
-        { table: "notifications", column: "user_id" },
-        { table: "business_notification_logs", column: "user_id" },
-        { table: "user_district_filters", column: "user_id" },
-        { table: "push_tokens", column: "user_id" },
-      ];
-
       await database.transaction(async (trx) => {
         await trx("directus_sessions").where({ user: userId }).del();
 
-        for (const { table, column } of ANONYMIZE_TABLES) {
-          await trx(table).where({ [column]: userId }).update({ [column]: null });
-        }
-
-        for (const { table, column } of HARD_DELETE_TABLES) {
-          await trx(table).where({ [column]: userId }).del();
-        }
-
-        // Soft-delete the user record itself: clear personal data, archive status.
-        // external_identifier=null ensures the same SSO account creates a fresh user on re-login.
+        // Soft-delete: archive the user and drop the SSO link so re-login creates
+        // a fresh user. Related operational/financial records are intentionally left
+        // untouched for now — anonymization will be handled in a follow-up.
         await trx("directus_users")
           .where({ id: userId })
           .update({
             status: "archived",
-            email: `deleted_${userId}@deleted.local`,
-            first_name: null,
-            last_name: null,
-            avatar: null,
-            phone: null,
             external_identifier: null,
-            subscription_tier: "free",
-            subscription_expires_at: null,
-            stored_card_user_token: null,
-            stored_card_token: null,
+            email: `deleted_${userId}@deleted.local`,
           });
       });
 
