@@ -62,6 +62,25 @@ async function verifyGoogleToken(
   return data;
 }
 
+// --- Helpers ---
+
+// Fetch all policy IDs attached to a user (directly or via their role).
+// Required in JWT for Directus 11+ permission checks — without it, refresh tokens
+// produce JWTs missing the `policies` claim and subsequent requests get 403.
+async function fetchUserPolicies(
+  database: any,
+  userId: string,
+  roleId: string | null,
+): Promise<string[]> {
+  const rows = await database("directus_access")
+    .where(function (this: any) {
+      this.where({ user: userId });
+      if (roleId) this.orWhere({ role: roleId });
+    })
+    .select("policy");
+  return rows.map((r: { policy: string }) => r.policy);
+}
+
 // --- Extension ---
 
 export default (router: Router, context: any) => {
@@ -130,6 +149,8 @@ export default (router: Router, context: any) => {
         }
       }
 
+      const policies = await fetchUserPolicies(database, user.id, user.role ?? null);
+
       const accessToken = jwt.sign(
         {
           id: user.id,
@@ -137,6 +158,7 @@ export default (router: Router, context: any) => {
           app_access: appAccess,
           admin_access: adminAccess,
           session: newSessionToken,
+          policies,
         },
         secret,
         { expiresIn: accessTokenTTL, issuer: "directus" },
@@ -235,6 +257,8 @@ export default (router: Router, context: any) => {
         }
       }
 
+      const policies = await fetchUserPolicies(database, user.id, user.role ?? null);
+
       const accessToken = jwt.sign(
         {
           id: user.id,
@@ -242,6 +266,7 @@ export default (router: Router, context: any) => {
           app_access: appAccess,
           admin_access: adminAccess,
           session: sessionToken,
+          policies,
         },
         secret,
         { expiresIn: accessTokenTTL, issuer: "directus" },
@@ -471,6 +496,8 @@ export default (router: Router, context: any) => {
         }
       }
 
+      const policies = await fetchUserPolicies(database, userId, user?.role ?? null);
+
       const accessToken = jwt.sign(
         {
           id: userId,
@@ -478,6 +505,7 @@ export default (router: Router, context: any) => {
           app_access: appAccess,
           admin_access: adminAccess,
           session: sessionToken,
+          policies,
         },
         secret,
         { expiresIn: accessTokenTTL, issuer: "directus" },
