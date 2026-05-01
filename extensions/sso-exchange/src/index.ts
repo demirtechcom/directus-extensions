@@ -430,7 +430,6 @@ export default (router: Router, context: any) => {
           email: userinfo.email,
           first_name: userinfo.given_name || null,
           last_name: userinfo.family_name || null,
-          provider: issuer,
           external_identifier: userinfo.sub,
           role: roleId,
         });
