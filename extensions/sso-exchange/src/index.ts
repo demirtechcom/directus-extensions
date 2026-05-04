@@ -1,4 +1,5 @@
 import type { Router } from "express";
+import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
