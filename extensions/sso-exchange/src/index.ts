@@ -1,4 +1,5 @@
 import type { Router } from "express";
+import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
@@ -62,14 +63,75 @@ async function verifyGoogleToken(
   return data;
 }
 
+// --- Shared helpers ---
+
+function parseTTL(ttl: string): number {
+  const match = ttl.match(/^(\d+)([smhd])$/);
+  if (!match) return 900_000;
+  const num = parseInt(match[1]);
+  const unit = match[2];
+  if (unit === "s") return num * 1_000;
+  if (unit === "m") return num * 60_000;
+  if (unit === "h") return num * 3_600_000;
+  if (unit === "d") return num * 86_400_000;
+  return 900_000;
+}
+
+// --- In-memory rate limiter ---
+
+interface RateEntry {
+  count: number;
+  windowStart: number;
+}
+
+const loginAttempts = new Map<string, RateEntry>();
+
+function checkRateLimit(ip: string, maxAttempts: number, windowMs: number): boolean {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now - entry.windowStart > windowMs) return true;
+  return entry.count < maxAttempts;
+}
+
+function recordFailedAttempt(ip: string, windowMs: number): void {
+  const now = Date.now();
+  const entry = loginAttempts.get(ip);
+  if (!entry || now - entry.windowStart > windowMs) {
+    loginAttempts.set(ip, { count: 1, windowStart: now });
+  } else {
+    entry.count++;
+  }
+}
+
+function resetRateLimit(ip: string): void {
+  loginAttempts.delete(ip);
+}
+
 // --- Extension ---
 
-export default (router: Router, context: any) => {
+export default async (router: Router, context: any) => {
   const { services, getSchema, database, env, logger } = context;
 
   const rawOrigins = env.SSO_WEB_ALLOWED_ORIGINS || "";
   const allowedOrigins = (Array.isArray(rawOrigins) ? rawOrigins : rawOrigins.split(",")).map((s: string) => s.trim()).filter(Boolean);
   logger.info(`[sso-exchange] SSO_WEB_ALLOWED_ORIGINS type=${typeof rawOrigins} isArray=${Array.isArray(rawOrigins)} raw=${JSON.stringify(rawOrigins)} parsed=${JSON.stringify(allowedOrigins)}`);
+
+  // --- Ensure username column exists on directus_users ---
+  try {
+    const hasUsername = await database.schema.hasColumn("directus_users", "username");
+    if (!hasUsername) {
+      await database.schema.table("directus_users", (t: any) => {
+        t.string("username", 64).nullable();
+        t.unique(["username"], { indexName: "idx_directus_users_username" });
+      });
+      logger.info("[sso-exchange] Created username column on directus_users");
+    }
+  } catch (err: any) {
+    logger.warn(`[sso-exchange] Username column migration skipped: ${err.message}`);
+  }
+
+  const rateLimitMax = parseInt(env.CREDENTIALS_RATE_LIMIT_MAX || "5");
+  const rateLimitWindowMs = parseTTL(env.CREDENTIALS_RATE_LIMIT_WINDOW || "15m");
 
   // --- Refresh endpoint ---
   router.post("/refresh", async (req: any, res: any) => {
@@ -105,19 +167,6 @@ export default (router: Router, context: any) => {
       const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
       const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
 
-      function parseTTL(ttl: string): number {
-        const match = ttl.match(/^(\d+)([smhd])$/);
-        if (!match) return 900000;
-        const num = parseInt(match[1]);
-        const unit = match[2];
-        if (unit === "s") return num * 1000;
-        if (unit === "m") return num * 60 * 1000;
-        if (unit === "h") return num * 3600 * 1000;
-        if (unit === "d") return num * 86400 * 1000;
-        return 900000;
-      }
-
-      // Rotate session token
       const newSessionToken = nanoid(64);
 
       let appAccess = true;
@@ -142,7 +191,6 @@ export default (router: Router, context: any) => {
         { expiresIn: accessTokenTTL, issuer: "directus" },
       );
 
-      // Delete old session, insert new one
       await database("directus_sessions").where({ token: refresh_token }).del();
       await database("directus_sessions").insert({
         token: newSessionToken,
@@ -161,14 +209,12 @@ export default (router: Router, context: any) => {
         },
       });
     } catch (error: any) {
-      console.error("[sso-exchange] Refresh error:", error.message);
+      logger.error(`[sso-exchange] Refresh error: ${error.message}`);
       return res.status(500).json({ errors: [{ message: "Refresh failed" }] });
     }
   });
 
   // --- Web SSO callback ---
-  // After Directus SSO redirect, this endpoint reads the session cookie,
-  // generates tokens, and redirects to the web app with tokens in the URL hash.
   router.get("/web-callback", async (req: any, res: any) => {
     try {
       const appUrl = req.query.app_url;
@@ -176,19 +222,16 @@ export default (router: Router, context: any) => {
         return res.status(400).send("app_url query parameter is required");
       }
 
-      // Allowed web app origins
       const appOrigin = new URL(appUrl).origin;
       if (allowedOrigins.length > 0 && !allowedOrigins.includes(appOrigin)) {
         return res.status(400).send("app_url origin not allowed");
       }
 
-      // Read the Directus session cookie
       const sessionCookie = req.cookies?.directus_session_token;
       if (!sessionCookie) {
         return res.redirect(`${appUrl}?error=no_session`);
       }
 
-      // Decode the session JWT to get the user ID
       const decoded = jwt.decode(sessionCookie) as { id?: string; session?: string } | null;
       if (!decoded?.id) {
         return res.redirect(`${appUrl}?error=invalid_session`);
@@ -210,19 +253,6 @@ export default (router: Router, context: any) => {
       const secret = env.SECRET;
       const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
       const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
-
-      function parseTTL(ttl: string): number {
-        const match = ttl.match(/^(\d+)([smhd])$/);
-        if (!match) return 900000;
-        const num = parseInt(match[1]);
-        const unit = match[2];
-        if (unit === "s") return num * 1000;
-        if (unit === "m") return num * 60 * 1000;
-        if (unit === "h") return num * 3600 * 1000;
-        if (unit === "d") return num * 86400 * 1000;
-        return 900000;
-      }
-
       const sessionToken = nanoid(64);
 
       let appAccess = true;
@@ -256,7 +286,6 @@ export default (router: Router, context: any) => {
         origin: appOrigin,
       });
 
-      // Redirect to web app with tokens in hash fragment (not query params, for security)
       const params = new URLSearchParams({
         access_token: accessToken,
         refresh_token: sessionToken,
@@ -265,15 +294,12 @@ export default (router: Router, context: any) => {
 
       return res.redirect(`${appUrl}#${params.toString()}`);
     } catch (error: any) {
-      console.error("[sso-exchange] Web callback error:", error.message);
+      logger.error(`[sso-exchange] Web callback error: ${error.message}`);
       return res.status(500).send("Authentication failed");
     }
   });
 
   // --- Delete account endpoint ---
-  // Soft-delete: archives the user record and clears personal data, anonymizes
-  // operational/financial records (user_id=NULL), and hard-deletes purely
-  // behavioral data. Audit/legal trail is preserved.
   router.delete("/delete-account", async (req: any, res: any) => {
     try {
       const authHeader = req.headers["authorization"];
@@ -300,17 +326,12 @@ export default (router: Router, context: any) => {
         return res.status(404).json({ status: "not_found" });
       }
 
-      // Idempotency: already archived
       if (user.status === "archived") {
         return res.json({ status: "deleted" });
       }
 
-      await database.transaction(async (trx) => {
+      await database.transaction(async (trx: any) => {
         await trx("directus_sessions").where({ user: userId }).del();
-
-        // Soft-delete: archive the user and drop the SSO link so re-login creates
-        // a fresh user. Related operational/financial records are intentionally left
-        // untouched for now — anonymization will be handled in a follow-up.
         await trx("directus_users")
           .where({ id: userId })
           .update({
@@ -329,14 +350,12 @@ export default (router: Router, context: any) => {
   });
 
   // --- Logout endpoint ---
-  // Clears the Directus session cookie and redirects to Keycloak logout
   router.get("/logout", (req: any, res: any) => {
     const redirectUrl = req.query.redirect_url;
     if (!redirectUrl) {
       return res.status(400).json({ errors: [{ message: "redirect_url is required" }] });
     }
 
-    // Validate redirect URL origin
     try {
       const origin = new URL(redirectUrl).origin;
       if (allowedOrigins.length > 0 && !allowedOrigins.includes(origin)) {
@@ -346,16 +365,13 @@ export default (router: Router, context: any) => {
       return res.status(400).json({ errors: [{ message: "Invalid redirect_url" }] });
     }
 
-    // Clear the Directus session cookie
     res.clearCookie("directus_session_token", { path: "/" });
 
-    // Redirect to Keycloak OIDC logout to end the SSO session
     const keycloakIssuerRaw = env.AUTH_KEYCLOAK_ISSUER_URL || "";
     const keycloakIssuer = keycloakIssuerRaw.replace(/\/\.well-known\/openid-configuration$/, "");
     const keycloakClientId = env.AUTH_KEYCLOAK_CLIENT_ID;
 
     if (!keycloakIssuer || !keycloakClientId) {
-      // Keycloak not configured — just redirect back
       return res.redirect(redirectUrl);
     }
 
@@ -366,7 +382,150 @@ export default (router: Router, context: any) => {
     return res.redirect(logoutUrl.toString());
   });
 
-  // --- Login endpoint ---
+  // --- Credentials register ---
+  router.post("/credentials/register", async (req: any, res: any) => {
+    try {
+      const { username, password, email, first_name, last_name } = req.body;
+
+      if (!username || typeof username !== "string") {
+        return res.status(400).json({ errors: [{ message: "username is required" }] });
+      }
+      if (!/^[a-zA-Z0-9_-]{3,32}$/.test(username)) {
+        return res.status(400).json({ errors: [{ message: "username must be 3–32 characters (letters, numbers, _ or -)" }] });
+      }
+      if (!password || typeof password !== "string" || password.length < 8) {
+        return res.status(400).json({ errors: [{ message: "password must be at least 8 characters" }] });
+      }
+      if (!email || typeof email !== "string" || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+        return res.status(400).json({ errors: [{ message: "valid email is required" }] });
+      }
+
+      const existingUsername = await database("directus_users")
+        .where({ username })
+        .select("id")
+        .first();
+      if (existingUsername) {
+        return res.status(409).json({ errors: [{ message: "Username already taken", extensions: { code: "USERNAME_TAKEN" } }] });
+      }
+
+      const schema = await getSchema();
+      const { UsersService } = services;
+      const usersService = new UsersService({ schema, knex: database, accountability: { admin: true } });
+
+      const existingEmail = await usersService.readByQuery({
+        filter: { email: { _eq: email } },
+        limit: 1,
+        fields: ["id"],
+      });
+      if (existingEmail.length > 0) {
+        return res.status(409).json({ errors: [{ message: "Email already registered", extensions: { code: "EMAIL_TAKEN" } }] });
+      }
+
+      const userId = await usersService.createOne({
+        username,
+        email,
+        password,
+        first_name: first_name || null,
+        last_name: last_name || null,
+        role: env.SSO_DEFAULT_ROLE_ID || null,
+      });
+
+      logger.info(`[sso-exchange] New credentials user registered: ${userId}`);
+      return res.status(201).json({ data: { id: userId, username } });
+    } catch (error: any) {
+      logger.error(`[sso-exchange] Register error: ${error.message}`);
+      return res.status(500).json({ errors: [{ message: "Registration failed" }] });
+    }
+  });
+
+  // --- Credentials login ---
+  router.post("/credentials/login", async (req: any, res: any) => {
+    const ip = (req.ip as string) || "unknown";
+    const INVALID_CREDS = {
+      errors: [{ message: "Invalid credentials", extensions: { code: "INVALID_CREDENTIALS" } }],
+    };
+
+    try {
+      const { username, password } = req.body;
+      if (!username || !password) {
+        return res.status(400).json({ errors: [{ message: "username and password are required" }] });
+      }
+
+      if (!checkRateLimit(ip, rateLimitMax, rateLimitWindowMs)) {
+        return res.status(429).json({
+          errors: [{ message: "Too many login attempts. Try again later.", extensions: { code: "RATE_LIMIT_EXCEEDED" } }],
+        });
+      }
+
+      // Fetch password hash directly — UsersService strips password on reads
+      const user = await database("directus_users")
+        .where({ username })
+        .select("id", "role", "status", "password")
+        .first();
+
+      if (!user || user.status !== "active") {
+        recordFailedAttempt(ip, rateLimitWindowMs);
+        return res.status(401).json(INVALID_CREDS);
+      }
+
+      const passwordValid = await argon2.verify(user.password, password);
+      if (!passwordValid) {
+        recordFailedAttempt(ip, rateLimitWindowMs);
+        return res.status(401).json(INVALID_CREDS);
+      }
+
+      resetRateLimit(ip);
+
+      const secret = env.SECRET;
+      const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
+      const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
+      const sessionToken = nanoid(64);
+
+      let appAccess = true;
+      let adminAccess = false;
+      if (user.role) {
+        const role = await database("directus_roles").where({ id: user.role }).first();
+        if (role) {
+          appAccess = role.app_access ?? true;
+          adminAccess = role.admin_access ?? false;
+        }
+      }
+
+      const accessToken = jwt.sign(
+        {
+          id: user.id,
+          role: user.role ?? null,
+          app_access: appAccess,
+          admin_access: adminAccess,
+          session: sessionToken,
+        },
+        secret,
+        { expiresIn: accessTokenTTL, issuer: "directus" },
+      );
+
+      await database("directus_sessions").insert({
+        token: sessionToken,
+        user: user.id,
+        expires: new Date(Date.now() + parseTTL(sessionTTL)),
+        ip,
+        user_agent: req.headers["user-agent"] || "sso-exchange-credentials",
+        origin: req.headers["origin"] || null,
+      });
+
+      return res.json({
+        data: {
+          access_token: accessToken,
+          refresh_token: sessionToken,
+          expires: parseTTL(accessTokenTTL),
+        },
+      });
+    } catch (error: any) {
+      logger.error(`[sso-exchange] Credentials login error: ${error.message}`);
+      return res.status(500).json({ errors: [{ message: "Login failed" }] });
+    }
+  });
+
+  // --- SSO login (Apple / Google) ---
   router.post("/", async (req: any, res: any) => {
     try {
       const { token, issuer, given_name: clientGivenName, family_name: clientFamilyName } = req.body;
@@ -383,7 +542,6 @@ export default (router: Router, context: any) => {
         });
       }
 
-      // 1. Verify token directly with provider
       let userinfo: {
         email: string;
         sub: string;
@@ -393,7 +551,6 @@ export default (router: Router, context: any) => {
 
       if (issuer === "apple") {
         userinfo = await verifyAppleToken(token);
-        // Apple JWT doesn't include names — use client-provided values
         if (clientGivenName) userinfo.given_name = clientGivenName;
         if (clientFamilyName) userinfo.family_name = clientFamilyName;
       } else {
@@ -401,7 +558,6 @@ export default (router: Router, context: any) => {
         userinfo = await verifyGoogleToken(token, googleAudience);
       }
 
-      // 2. Find or create Directus user
       const schema = await getSchema();
       const { UsersService } = services;
       const usersService = new UsersService({ schema, knex: database });
@@ -416,7 +572,6 @@ export default (router: Router, context: any) => {
       if (users.length > 0) {
         userId = users[0].id;
 
-        // Update name if currently missing and provider gives us one
         const existing = users[0];
         const nameUpdate: Record<string, string> = {};
         if (!existing.first_name && userinfo.given_name) nameUpdate.first_name = userinfo.given_name;
@@ -436,34 +591,17 @@ export default (router: Router, context: any) => {
         users = [{ id: userId, role: roleId }];
       }
 
-      // 3. Generate Directus tokens
       const secret = env.SECRET;
       const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
       const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
-
-      function parseTTL(ttl: string): number {
-        const match = ttl.match(/^(\d+)([smhd])$/);
-        if (!match) return 900000;
-        const num = parseInt(match[1]);
-        const unit = match[2];
-        if (unit === "s") return num * 1000;
-        if (unit === "m") return num * 60 * 1000;
-        if (unit === "h") return num * 3600 * 1000;
-        if (unit === "d") return num * 86400 * 1000;
-        return 900000;
-      }
-
       const accessExpires = parseTTL(accessTokenTTL);
       const sessionToken = nanoid(64);
 
-      // Fetch role permissions
       const user = users[0];
       let appAccess = true;
       let adminAccess = false;
       if (user?.role) {
-        const role = await database("directus_roles")
-          .where({ id: user.role })
-          .first();
+        const role = await database("directus_roles").where({ id: user.role }).first();
         if (role) {
           appAccess = role.app_access ?? true;
           adminAccess = role.admin_access ?? false;
@@ -499,7 +637,7 @@ export default (router: Router, context: any) => {
         },
       });
     } catch (error: any) {
-      console.error("[sso-exchange] Error:", error.message);
+      logger.error(`[sso-exchange] SSO error: ${error.message}`);
       return res.status(401).json({
         errors: [{ message: error.message || "Authentication failed" }],
       });
