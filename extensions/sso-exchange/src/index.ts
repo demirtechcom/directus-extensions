@@ -1,5 +1,4 @@
 import type { Router } from "express";
-import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
@@ -382,7 +381,6 @@ export default async (router: Router, context: any) => {
     return res.redirect(logoutUrl.toString());
   });
 
-  // --- Credentials register ---
   router.post("/credentials/register", async (req: any, res: any) => {
     try {
       const { username, password, email, first_name, last_name } = req.body;
@@ -400,23 +398,20 @@ export default async (router: Router, context: any) => {
         return res.status(400).json({ errors: [{ message: "valid email is required" }] });
       }
 
-      const existingUsername = await database("directus_users")
-        .where({ username })
-        .select("id")
-        .first();
+      const existingUsername = await database("directus_users").where({ username }).select("id").first();
       if (existingUsername) {
         return res.status(409).json({ errors: [{ message: "Username already taken", extensions: { code: "USERNAME_TAKEN" } }] });
       }
 
       const schema = await getSchema();
       const { UsersService } = services;
-      const usersService = new UsersService({ schema, knex: database, accountability: { admin: true } });
-
-      const existingEmail = await usersService.readByQuery({
-        filter: { email: { _eq: email } },
-        limit: 1,
-        fields: ["id"],
+      const usersService = new UsersService({
+        schema,
+        knex: database,
+        accountability: { user: null, role: null, admin: true, app: false },
       });
+
+      const existingEmail = await usersService.readByQuery({ filter: { email: { _eq: email } }, limit: 1, fields: ["id"] });
       if (existingEmail.length > 0) {
         return res.status(409).json({ errors: [{ message: "Email already registered", extensions: { code: "EMAIL_TAKEN" } }] });
       }
@@ -425,6 +420,7 @@ export default async (router: Router, context: any) => {
         username,
         email,
         password,
+        status: "active",
         first_name: first_name || null,
         last_name: last_name || null,
         role: env.SSO_DEFAULT_ROLE_ID || null,
@@ -438,7 +434,6 @@ export default async (router: Router, context: any) => {
     }
   });
 
-  // --- Credentials login ---
   router.post("/credentials/login", async (req: any, res: any) => {
     const ip = (req.ip as string) || "unknown";
     const INVALID_CREDS = {
@@ -447,7 +442,7 @@ export default async (router: Router, context: any) => {
 
     try {
       const { username, password } = req.body;
-      if (!username || !password) {
+      if (!username || typeof username !== "string" || !password || typeof password !== "string") {
         return res.status(400).json({ errors: [{ message: "username and password are required" }] });
       }
 
@@ -457,68 +452,34 @@ export default async (router: Router, context: any) => {
         });
       }
 
-      // Fetch password hash directly — UsersService strips password on reads
-      const user = await database("directus_users")
+      const userRow = await database("directus_users")
         .where({ username })
-        .select("id", "role", "status", "password")
+        .select("id", "status", "email")
         .first();
 
-      if (!user || user.status !== "active") {
+      if (!userRow || userRow.status !== "active") {
         recordFailedAttempt(ip, rateLimitWindowMs);
         return res.status(401).json(INVALID_CREDS);
       }
 
-      const passwordValid = await argon2.verify(user.password, password);
-      if (!passwordValid) {
+      const schema = await getSchema();
+      const { AuthenticationService } = services;
+      const authService = new AuthenticationService({
+        schema,
+        knex: database,
+        accountability: { user: null, role: null, admin: false, app: false, ip },
+      });
+
+      let authResult: { access_token: string; refresh_token: string; expires: number };
+      try {
+        authResult = await authService.login("json", { email: userRow.email, password });
+      } catch {
         recordFailedAttempt(ip, rateLimitWindowMs);
         return res.status(401).json(INVALID_CREDS);
       }
 
       resetRateLimit(ip);
-
-      const secret = env.SECRET;
-      const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
-      const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
-      const sessionToken = nanoid(64);
-
-      let appAccess = true;
-      let adminAccess = false;
-      if (user.role) {
-        const role = await database("directus_roles").where({ id: user.role }).first();
-        if (role) {
-          appAccess = role.app_access ?? true;
-          adminAccess = role.admin_access ?? false;
-        }
-      }
-
-      const accessToken = jwt.sign(
-        {
-          id: user.id,
-          role: user.role ?? null,
-          app_access: appAccess,
-          admin_access: adminAccess,
-          session: sessionToken,
-        },
-        secret,
-        { expiresIn: accessTokenTTL, issuer: "directus" },
-      );
-
-      await database("directus_sessions").insert({
-        token: sessionToken,
-        user: user.id,
-        expires: new Date(Date.now() + parseTTL(sessionTTL)),
-        ip,
-        user_agent: req.headers["user-agent"] || "sso-exchange-credentials",
-        origin: req.headers["origin"] || null,
-      });
-
-      return res.json({
-        data: {
-          access_token: accessToken,
-          refresh_token: sessionToken,
-          expires: parseTTL(accessTokenTTL),
-        },
-      });
+      return res.json({ data: authResult });
     } catch (error: any) {
       logger.error(`[sso-exchange] Credentials login error: ${error.message}`);
       return res.status(500).json({ errors: [{ message: "Login failed" }] });

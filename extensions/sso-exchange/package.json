@@ -19,7 +19,6 @@
     "typescript": "^5.0.0"
   },
   "dependencies": {
-    "argon2": "^0.31.2",
     "jsonwebtoken": "^9.0.3",
     "jwks-rsa": "^4.0.1",
     "nanoid": "^3.3.11"
