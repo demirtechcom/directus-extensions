@@ -421,12 +421,15 @@ export default (router: Router, context: any) => {
       const userId = await usersService.createOne({
         username,
         email,
-        password,
         status: "active",
         first_name: first_name || null,
         last_name: last_name || null,
         role: env.SSO_DEFAULT_ROLE_ID || null,
       });
+
+      // UsersService may not persist the password field — hash and write directly
+      const hashedPassword = await argon2.hash(password);
+      await database("directus_users").where({ id: userId }).update({ password: hashedPassword });
 
       logger.info(`[sso-exchange] New credentials user registered: ${userId}`);
       return res.status(201).json({ data: { id: userId, username } });
