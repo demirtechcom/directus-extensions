@@ -109,26 +109,28 @@ function resetRateLimit(ip: string): void {
 
 // --- Extension ---
 
-export default async (router: Router, context: any) => {
+export default (router: Router, context: any) => {
   const { services, getSchema, database, env, logger } = context;
 
   const rawOrigins = env.SSO_WEB_ALLOWED_ORIGINS || "";
   const allowedOrigins = (Array.isArray(rawOrigins) ? rawOrigins : rawOrigins.split(",")).map((s: string) => s.trim()).filter(Boolean);
   logger.info(`[sso-exchange] SSO_WEB_ALLOWED_ORIGINS type=${typeof rawOrigins} isArray=${Array.isArray(rawOrigins)} raw=${JSON.stringify(rawOrigins)} parsed=${JSON.stringify(allowedOrigins)}`);
 
-  // --- Ensure username column exists on directus_users ---
-  try {
-    const hasUsername = await database.schema.hasColumn("directus_users", "username");
-    if (!hasUsername) {
-      await database.schema.table("directus_users", (t: any) => {
-        t.string("username", 64).nullable();
-        t.unique(["username"], { indexName: "idx_directus_users_username" });
-      });
-      logger.info("[sso-exchange] Created username column on directus_users");
+  // --- Ensure username column exists on directus_users (fire-and-forget) ---
+  (async () => {
+    try {
+      const hasUsername = await database.schema.hasColumn("directus_users", "username");
+      if (!hasUsername) {
+        await database.schema.table("directus_users", (t: any) => {
+          t.string("username", 64).nullable();
+          t.unique(["username"], { indexName: "idx_directus_users_username" });
+        });
+        logger.info("[sso-exchange] Created username column on directus_users");
+      }
+    } catch (err: any) {
+      logger.warn(`[sso-exchange] Username column migration skipped: ${err.message}`);
     }
-  } catch (err: any) {
-    logger.warn(`[sso-exchange] Username column migration skipped: ${err.message}`);
-  }
+  })();
 
   const rateLimitMax = parseInt(env.CREDENTIALS_RATE_LIMIT_MAX || "5");
   const rateLimitWindowMs = parseTTL(env.CREDENTIALS_RATE_LIMIT_WINDOW || "15m");
