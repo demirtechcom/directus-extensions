@@ -1,4 +1,5 @@
 import type { Router } from "express";
+import { randomUUID } from "crypto";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
@@ -405,29 +406,24 @@ export default (router: Router, context: any) => {
         return res.status(409).json({ errors: [{ message: "Username already taken", extensions: { code: "USERNAME_TAKEN" } }] });
       }
 
-      const schema = await getSchema();
-      const { UsersService } = services;
-      const usersService = new UsersService({
-        schema,
-        knex: database,
-        accountability: { user: null, role: null, admin: true, app: false },
-      });
-
-      const existingEmail = await usersService.readByQuery({ filter: { email: { _eq: email } }, limit: 1, fields: ["id"] });
-      if (existingEmail.length > 0) {
+      const existingEmail = await database("directus_users").where({ email }).select("id").first();
+      if (existingEmail) {
         return res.status(409).json({ errors: [{ message: "Email already registered", extensions: { code: "EMAIL_TAKEN" } }] });
       }
 
-      const userId = await usersService.createOne({
+      const userId = randomUUID();
+      await database("directus_users").insert({
+        id: userId,
         username,
         email,
+        password,
         status: "active",
         first_name: first_name || null,
         last_name: last_name || null,
         role: env.SSO_DEFAULT_ROLE_ID || null,
+        provider: "default",
+        token: null,
       });
-
-      await database("directus_users").where({ id: userId }).update({ password });
 
       logger.info(`[sso-exchange] New credentials user registered: ${userId}`);
       return res.status(201).json({ data: { id: userId, username } });
