@@ -17,10 +17,10 @@ function getClientIp(req: any): string {
 export default (router: Router, context: any) => {
   const { env, services, getSchema } = context;
 
-  // Plan adına göre atanacak Directus role ID'si.
+  // Plan adına göre atanacak Directus policy ID'si.
   // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
-  const PLAN_ROLE_MAP: Record<string, string> = {
-    "Customer Pro": String(env["BUSINESS_ROLE_ID"] || ""),
+  const PLAN_POLICY_MAP: Record<string, string> = {
+    "Customer Pro": String(env["BUSINESS_POLICY_ID"] || ""),
   };
 
   // --- Shared helpers ---
@@ -36,6 +36,30 @@ export default (router: Router, context: any) => {
       failUrl: String(env["PAYTR_FAIL_URL"] || ""),
       appUrl: String(env["PAYMENTS_APP_URL"] || env["PAYTR_APP_URL"] || "http://localhost:8081"),
     };
+  }
+
+  async function grantPolicyAccess(userId: string, policyId: string) {
+    const schema = await getSchema();
+    const accessService = new services.ItemsService("directus_access", { schema, accountability: { admin: true } });
+    const existing = await accessService.readByQuery({
+      filter: { user: { _eq: userId }, policy: { _eq: policyId } },
+      limit: 1,
+    });
+    if (existing.length === 0) {
+      await accessService.createOne({ user: userId, policy: policyId });
+    }
+  }
+
+  async function revokePolicyAccess(userId: string, policyId: string) {
+    const schema = await getSchema();
+    const accessService = new services.ItemsService("directus_access", { schema, accountability: { admin: true } });
+    const records = await accessService.readByQuery({
+      filter: { user: { _eq: userId }, policy: { _eq: policyId } },
+      fields: ["id"],
+    });
+    if (records.length > 0) {
+      await accessService.deleteOne(records[0].id);
+    }
   }
 
   async function activateSubscription(
@@ -64,14 +88,30 @@ export default (router: Router, context: any) => {
     if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
     if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
 
-    const plan = await plansService.readOne(planId, { fields: ["name"] });
-    const targetRoleId = plan?.name ? PLAN_ROLE_MAP[plan.name] : "";
-    if (targetRoleId) {
-      userUpdate.role = targetRoleId;
-      console.log("[payments] role updated", { userId, planName: plan.name, toRole: targetRoleId });
-    }
-
     await usersService.updateOne(userId, userUpdate);
+
+    const plan = await plansService.readOne(planId, { fields: ["name"] });
+    const targetPolicyId = plan?.name ? PLAN_POLICY_MAP[plan.name] : "";
+    if (targetPolicyId) {
+      await grantPolicyAccess(userId, targetPolicyId);
+      console.log("[payments] policy granted", { userId, planName: plan.name, policy: targetPolicyId });
+    }
+  }
+
+  async function deactivateSubscription(userId: string, planName: string) {
+    const schema = await getSchema();
+    const usersService = new services.UsersService({ schema, accountability: { admin: true } });
+
+    await usersService.updateOne(userId, {
+      subscription_tier: null,
+      subscription_expires_at: null,
+    });
+
+    const targetPolicyId = PLAN_POLICY_MAP[planName];
+    if (targetPolicyId) {
+      await revokePolicyAccess(userId, targetPolicyId);
+      console.log("[payments] policy revoked", { userId, planName, policy: targetPolicyId });
+    }
   }
 
   async function findPendingPayment(merchantOid: string) {
@@ -217,6 +257,43 @@ export default (router: Router, context: any) => {
     } catch (err: any) {
       console.error("[payments] check-status error:", err.message);
       return res.status(500).json({ error: "Status check failed" });
+    }
+  });
+
+  // ─── CANCEL ──────────────────────────────────────────────────
+  router.post("/cancel", async (req: any, res: any) => {
+    try {
+      const userId = req.accountability?.user;
+      if (!userId) return res.status(401).json({ error: "Authentication required" });
+
+      const schema = await getSchema();
+      const usersService = new services.UsersService({ schema, accountability: { admin: true } });
+      const user = await usersService.readOne(userId, { fields: ["subscription_tier"] });
+
+      if (!user?.subscription_tier) {
+        return res.status(400).json({ error: "No active subscription" });
+      }
+
+      const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
+      const plansService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
+      const lastPayment = await paymentsService.readByQuery({
+        filter: { user_id: { _eq: userId }, payment_status: { _eq: "success" } },
+        sort: ["-date_created"],
+        fields: ["plan_id"],
+        limit: 1,
+      });
+
+      if (lastPayment.length > 0) {
+        const plan = await plansService.readOne(lastPayment[0].plan_id, { fields: ["name"] });
+        if (plan?.name) {
+          await deactivateSubscription(userId, plan.name);
+        }
+      }
+
+      return res.json({ success: true });
+    } catch (err: any) {
+      console.error("[payments] cancel error:", err.message);
+      return res.status(500).json({ error: "Cancellation failed" });
     }
   });
 
