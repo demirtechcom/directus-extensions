@@ -1,5 +1,4 @@
 import type { Router } from "express";
-import argon2 from "argon2";
 import jwt from "jsonwebtoken";
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
@@ -428,8 +427,7 @@ export default (router: Router, context: any) => {
         role: env.SSO_DEFAULT_ROLE_ID || null,
       });
 
-      const hashedPassword = await argon2.hash(password);
-      await database("directus_users").where({ id: userId }).update({ password: hashedPassword });
+      await database("directus_users").where({ id: userId }).update({ password });
 
       logger.info(`[sso-exchange] New credentials user registered: ${userId}`);
       return res.status(201).json({ data: { id: userId, username } });
