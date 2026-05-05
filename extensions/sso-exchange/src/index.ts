@@ -457,7 +457,7 @@ export default (router: Router, context: any) => {
 
       const userRow = await database("directus_users")
         .where({ username })
-        .select("id", "status", "email")
+        .select("id", "status", "role", "password")
         .first();
 
       if (!userRow || userRow.status !== "active") {
@@ -465,24 +465,55 @@ export default (router: Router, context: any) => {
         return res.status(401).json(INVALID_CREDS);
       }
 
-      const schema = await getSchema();
-      const { AuthenticationService } = services;
-      const authService = new AuthenticationService({
-        schema,
-        knex: database,
-        accountability: { user: null, role: null, admin: false, app: false, ip },
-      });
-
-      let authResult: { access_token: string; refresh_token: string; expires: number };
-      try {
-        authResult = await authService.login("json", { email: userRow.email, password });
-      } catch {
+      if (userRow.password !== password) {
         recordFailedAttempt(ip, rateLimitWindowMs);
         return res.status(401).json(INVALID_CREDS);
       }
 
+      const secret = env.SECRET;
+      const accessTokenTTL = env.ACCESS_TOKEN_TTL || "15m";
+      const sessionTTL = env.REFRESH_TOKEN_TTL || "7d";
+      const sessionToken = nanoid(64);
+
+      let appAccess = true;
+      let adminAccess = false;
+      if (userRow.role) {
+        const role = await database("directus_roles").where({ id: userRow.role }).first();
+        if (role) {
+          appAccess = role.app_access ?? true;
+          adminAccess = role.admin_access ?? false;
+        }
+      }
+
+      const accessToken = jwt.sign(
+        {
+          id: userRow.id,
+          role: userRow.role ?? null,
+          app_access: appAccess,
+          admin_access: adminAccess,
+          session: sessionToken,
+        },
+        secret,
+        { expiresIn: accessTokenTTL, issuer: "directus" },
+      );
+
+      await database("directus_sessions").insert({
+        token: sessionToken,
+        user: userRow.id,
+        expires: new Date(Date.now() + parseTTL(sessionTTL)),
+        ip,
+        user_agent: req.headers["user-agent"] || "sso-exchange",
+        origin: req.headers["origin"] || null,
+      });
+
       resetRateLimit(ip);
-      return res.json({ data: authResult });
+      return res.json({
+        data: {
+          access_token: accessToken,
+          refresh_token: sessionToken,
+          expires: parseTTL(accessTokenTTL),
+        },
+      });
     } catch (error: any) {
       logger.error(`[sso-exchange] Credentials login error: ${error.message}`);
       return res.status(500).json({ errors: [{ message: "Login failed" }] });
