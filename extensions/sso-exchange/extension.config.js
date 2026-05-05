@@ -15,6 +15,20 @@ function stubOptionalDeps(stubs) {
   };
 }
 
+function polyfillNodeGlobals() {
+  return {
+    name: 'polyfill-node-globals',
+    renderChunk(code) {
+      const polyfill =
+        'import{fileURLToPath as __polyfill_fup}from"url";' +
+        'import{dirname as __polyfill_dn}from"path";' +
+        'const __filename=__polyfill_fup(import.meta.url);' +
+        'const __dirname=__polyfill_dn(__filename);\n';
+      return { code: polyfill + code, map: null };
+    },
+  };
+}
+
 export default {
   plugins: [
     stubOptionalDeps({
@@ -22,5 +36,6 @@ export default {
       'nock': 'export default function nock() { return {}; }',
       'aws-sdk': 'export default {}',
     }),
+    polyfillNodeGlobals(),
   ],
 };
