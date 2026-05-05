@@ -15,7 +15,7 @@ function getClientIp(req: any): string {
 }
 
 export default (router: Router, context: any) => {
-  const { env, services, getSchema } = context;
+  const { env, services, getSchema, database } = context;
 
   // Plan adına göre atanacak Directus policy ID'si.
   // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
@@ -39,27 +39,22 @@ export default (router: Router, context: any) => {
   }
 
   async function grantPolicyAccess(userId: string, policyId: string) {
-    const schema = await getSchema();
-    const accessService = new services.ItemsService("directus_access", { schema, accountability: { admin: true } });
-    const existing = await accessService.readByQuery({
-      filter: { user: { _eq: userId }, policy: { _eq: policyId } },
-      limit: 1,
-    });
-    if (existing.length === 0) {
-      await accessService.createOne({ user: userId, policy: policyId });
+    const existing = await database("directus_access")
+      .where({ user: userId, policy: policyId })
+      .first();
+    if (!existing) {
+      await database("directus_access").insert({
+        id: crypto.randomUUID(),
+        user: userId,
+        policy: policyId,
+      });
     }
   }
 
   async function revokePolicyAccess(userId: string, policyId: string) {
-    const schema = await getSchema();
-    const accessService = new services.ItemsService("directus_access", { schema, accountability: { admin: true } });
-    const records = await accessService.readByQuery({
-      filter: { user: { _eq: userId }, policy: { _eq: policyId } },
-      fields: ["id"],
-    });
-    if (records.length > 0) {
-      await accessService.deleteOne(records[0].id);
-    }
+    await database("directus_access")
+      .where({ user: userId, policy: policyId })
+      .delete();
   }
 
   async function activateSubscription(
