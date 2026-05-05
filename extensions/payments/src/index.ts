@@ -15,13 +15,19 @@ function getClientIp(req: any): string {
 }
 
 export default (router: Router, context: any) => {
-  const { env, services, getSchema, database } = context;
+  const { env, services, getSchema, database, logger } = context;
 
   // Plan adına göre atanacak Directus policy ID'si.
   // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
   const PLAN_POLICY_MAP: Record<string, string> = {
     "Customer Pro": String(env["BUSINESS_POLICY_ID"] || ""),
   };
+
+  if (!env["BUSINESS_POLICY_ID"]) {
+    logger.warn("[payments] BUSINESS_POLICY_ID is not set — subscription policy grants will be skipped");
+  } else {
+    logger.info(`[payments] BUSINESS_POLICY_ID loaded: ${String(env["BUSINESS_POLICY_ID"]).slice(0, 8)}...`);
+  }
 
   // --- Shared helpers ---
 
@@ -39,22 +45,36 @@ export default (router: Router, context: any) => {
   }
 
   async function grantPolicyAccess(userId: string, policyId: string) {
-    const existing = await database("directus_access")
-      .where({ user: userId, policy: policyId })
-      .first();
-    if (!existing) {
-      await database("directus_access").insert({
-        id: crypto.randomUUID(),
-        user: userId,
-        policy: policyId,
-      });
+    try {
+      const existing = await database("directus_access")
+        .where({ user: userId, policy: policyId })
+        .first();
+      if (!existing) {
+        await database("directus_access").insert({
+          id: crypto.randomUUID(),
+          user: userId,
+          policy: policyId,
+        });
+        logger.info(`[payments] directus_access row inserted: user=${userId} policy=${policyId}`);
+      } else {
+        logger.info(`[payments] directus_access already exists: user=${userId} policy=${policyId}`);
+      }
+    } catch (err: any) {
+      logger.error(`[payments] grantPolicyAccess failed: ${err.message}`);
+      throw err;
     }
   }
 
   async function revokePolicyAccess(userId: string, policyId: string) {
-    await database("directus_access")
-      .where({ user: userId, policy: policyId })
-      .delete();
+    try {
+      await database("directus_access")
+        .where({ user: userId, policy: policyId })
+        .delete();
+      logger.info(`[payments] directus_access row deleted: user=${userId} policy=${policyId}`);
+    } catch (err: any) {
+      logger.error(`[payments] revokePolicyAccess failed: ${err.message}`);
+      throw err;
+    }
   }
 
   async function activateSubscription(
@@ -86,10 +106,12 @@ export default (router: Router, context: any) => {
     await usersService.updateOne(userId, userUpdate);
 
     const plan = await plansService.readOne(planId, { fields: ["name"] });
+    logger.info(`[payments] activateSubscription planId=${planId} planName=${plan?.name}`);
     const targetPolicyId = plan?.name ? PLAN_POLICY_MAP[plan.name] : "";
     if (targetPolicyId) {
       await grantPolicyAccess(userId, targetPolicyId);
-      console.log("[payments] policy granted", { userId, planName: plan.name, policy: targetPolicyId });
+    } else {
+      logger.warn(`[payments] no policy mapped for plan "${plan?.name}" — check PLAN_POLICY_MAP and BUSINESS_POLICY_ID`);
     }
   }
 
@@ -105,7 +127,7 @@ export default (router: Router, context: any) => {
     const targetPolicyId = PLAN_POLICY_MAP[planName];
     if (targetPolicyId) {
       await revokePolicyAccess(userId, targetPolicyId);
-      console.log("[payments] policy revoked", { userId, planName, policy: targetPolicyId });
+      logger.info(`[payments] policy revoked userId=${userId} planName=${planName} policy=${targetPolicyId}`);
     }
   }
 
@@ -144,7 +166,7 @@ export default (router: Router, context: any) => {
 
       const config = getPayTRConfig();
       if (!config.merchantId || !config.merchantKey || !config.merchantSalt) {
-        console.error("[payments] Missing merchant credentials");
+        logger.error("[payments] Missing merchant credentials — check PAYTR_MERCHANT_ID/KEY/SALT env vars");
         return res.status(500).json({ error: "Payment service not configured" });
       }
 
@@ -189,7 +211,7 @@ export default (router: Router, context: any) => {
       }).then((r) => r.json() as Promise<{ status: string; token?: string; reason?: string }>);
 
       if (tokenRes.status !== "success") {
-        console.error("[payments] Provider token error:", tokenRes.reason);
+        logger.error(`[payments] provider token error: ${tokenRes.reason}`);
         return res.status(400).json({ error: "Payment provider error" });
       }
 
@@ -206,7 +228,7 @@ export default (router: Router, context: any) => {
 
       return res.json({ token: tokenRes.token, merchant_oid: merchantOid });
     } catch (err: any) {
-      console.error("[payments] get-token error:", err.message);
+      logger.error(`[payments] get-token error: ${err.message}\n${err.stack}`);
       return res.status(500).json({ error: "Payment request failed" });
     }
   });
@@ -238,19 +260,28 @@ export default (router: Router, context: any) => {
         }).toString(),
       }).then((r) => r.json() as Promise<any>);
 
+      logger.info(`[payments] check-status paytr response: status=${statusRes.status} odeme_tipi=${statusRes.odeme_tipi}`);
+
       if (statusRes.status !== "success") {
         return res.json({ payment_status: "pending" });
       }
 
       const payment = await findPendingPayment(merchantOid);
-      if (payment && payment.payment_status === "pending") {
+      if (!payment) {
+        logger.warn(`[payments] check-status: no payment found for merchant_oid=${merchantOid}`);
+        return res.json({ payment_status: "success" });
+      }
+
+      logger.info(`[payments] check-status payment found — id=${payment.id} status=${payment.payment_status}`);
+
+      if (payment.payment_status === "pending") {
         await activateSubscription(payment.user_id, payment.plan_id, payment.id, statusRes.odeme_tipi || "card", {});
-        console.log("[payments] Activated via status check:", merchantOid);
+        logger.info(`[payments] activated via check-status: ${merchantOid}`);
       }
 
       return res.json({ payment_status: "success" });
     } catch (err: any) {
-      console.error("[payments] check-status error:", err.message);
+      logger.error(`[payments] check-status error: ${err.message}\n${err.stack}`);
       return res.status(500).json({ error: "Status check failed" });
     }
   });
@@ -287,7 +318,7 @@ export default (router: Router, context: any) => {
 
       return res.json({ success: true });
     } catch (err: any) {
-      console.error("[payments] cancel error:", err.message);
+      logger.error(`[payments] cancel error: ${err.message}\n${err.stack}`);
       return res.status(500).json({ error: "Cancellation failed" });
     }
   });
@@ -296,12 +327,16 @@ export default (router: Router, context: any) => {
   router.post("/callback", async (req: any, res: any) => {
     try {
       const body = req.body || {};
+      logger.info(`[payments] callback received — body keys: ${Object.keys(body).join(", ")}`);
+
       const { merchant_oid, status, total_amount, hash, payment_type, failed_reason_msg } = body;
 
       if (!merchant_oid || !status || !hash) {
-        console.log("[payments] Callback body empty or unparsed");
+        logger.warn(`[payments] callback missing required fields — merchant_oid=${merchant_oid} status=${status} hash=${!!hash}`);
         return res.send("OK");
       }
+
+      logger.info(`[payments] callback merchant_oid=${merchant_oid} status=${status} total_amount=${total_amount}`);
 
       const config = getPayTRConfig();
       const expectedHash = hmacSha256Base64(
@@ -310,19 +345,30 @@ export default (router: Router, context: any) => {
       );
 
       if (hash !== expectedHash) {
-        console.error("[payments] Hash mismatch for", merchant_oid);
+        logger.error(`[payments] hash mismatch for ${merchant_oid} — expected=${expectedHash} got=${hash}`);
         return res.send("OK");
       }
 
+      logger.info(`[payments] hash verified for ${merchant_oid}`);
+
       const payment = await findPendingPayment(merchant_oid);
-      if (!payment || payment.payment_status !== "pending") return res.send("OK");
+      if (!payment) {
+        logger.warn(`[payments] no payment record found for merchant_oid=${merchant_oid}`);
+        return res.send("OK");
+      }
+      if (payment.payment_status !== "pending") {
+        logger.info(`[payments] payment already processed — merchant_oid=${merchant_oid} status=${payment.payment_status}`);
+        return res.send("OK");
+      }
+
+      logger.info(`[payments] payment found — id=${payment.id} user_id=${payment.user_id} plan_id=${payment.plan_id}`);
 
       if (status === "success") {
         await activateSubscription(payment.user_id, payment.plan_id, payment.id, payment_type || null, {
           userToken: body.utoken,
           cardToken: body.ctoken,
         });
-        console.log("[payments] Success via callback:", merchant_oid);
+        logger.info(`[payments] activation complete for merchant_oid=${merchant_oid}`);
       } else {
         const schema = await getSchema();
         const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
@@ -330,12 +376,12 @@ export default (router: Router, context: any) => {
           payment_status: "failed",
           failed_reason: failed_reason_msg || "Payment failed",
         });
-        console.log("[payments] Failed:", merchant_oid, failed_reason_msg);
+        logger.warn(`[payments] payment failed merchant_oid=${merchant_oid} reason=${failed_reason_msg}`);
       }
 
       return res.send("OK");
     } catch (err: any) {
-      console.error("[payments] callback error:", err.message);
+      logger.error(`[payments] callback error: ${err.message}\n${err.stack}`);
       return res.send("OK");
     }
   });
