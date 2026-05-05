@@ -1,6 +1,23 @@
 import type { Router } from "express";
-import { randomUUID } from "crypto";
+import { randomUUID, scrypt, randomBytes, timingSafeEqual } from "crypto";
+import { promisify } from "util";
 import jwt from "jsonwebtoken";
+
+const scryptAsync = promisify(scrypt);
+
+async function hashPassword(password: string): Promise<string> {
+  const salt = randomBytes(16).toString("hex");
+  const hash = (await scryptAsync(password, salt, 64)) as Buffer;
+  return `${salt}:${hash.toString("hex")}`;
+}
+
+async function verifyPassword(password: string, stored: string): Promise<boolean> {
+  const [salt, hash] = stored.split(":");
+  if (!salt || !hash) return false;
+  const hashBuffer = Buffer.from(hash, "hex");
+  const derived = (await scryptAsync(password, salt, 64)) as Buffer;
+  return timingSafeEqual(hashBuffer, derived);
+}
 import jwksClient from "jwks-rsa";
 import { nanoid } from "nanoid";
 
@@ -416,7 +433,7 @@ export default (router: Router, context: any) => {
         id: userId,
         username,
         email,
-        password,
+        password: await hashPassword(password),
         status: "active",
         first_name: first_name || null,
         last_name: last_name || null,
@@ -461,7 +478,7 @@ export default (router: Router, context: any) => {
         return res.status(401).json(INVALID_CREDS);
       }
 
-      if (userRow.password !== password) {
+      if (!userRow.password || !(await verifyPassword(password, userRow.password))) {
         recordFailedAttempt(ip, rateLimitWindowMs);
         return res.status(401).json(INVALID_CREDS);
       }
