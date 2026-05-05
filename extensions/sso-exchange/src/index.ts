@@ -428,7 +428,6 @@ export default (router: Router, context: any) => {
         role: env.SSO_DEFAULT_ROLE_ID || null,
       });
 
-      // UsersService may not persist the password field — hash and write directly
       const hashedPassword = await argon2.hash(password);
       await database("directus_users").where({ id: userId }).update({ password: hashedPassword });
 
