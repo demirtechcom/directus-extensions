@@ -15,7 +15,17 @@ function getClientIp(req: any): string {
 }
 
 export default (router: Router, context: any) => {
-  const { env, services, getSchema, database, logger } = context;
+  const { env, services, getSchema, database, logger, getCache } = context;
+  const { cache, systemCache } = getCache?.() ?? {};
+
+  async function invalidatePermissionsCache() {
+    try {
+      await cache?.clear();
+      await systemCache?.clear();
+    } catch (err: any) {
+      logger.warn(`[payments] cache invalidation failed: ${err.message}`);
+    }
+  }
 
   // Plan adına göre atanacak Directus policy ID'si.
   // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
@@ -55,6 +65,7 @@ export default (router: Router, context: any) => {
           user: userId,
           policy: policyId,
         });
+        await invalidatePermissionsCache();
         logger.info(`[payments] directus_access row inserted: user=${userId} policy=${policyId}`);
       } else {
         logger.info(`[payments] directus_access already exists: user=${userId} policy=${policyId}`);
@@ -70,6 +81,7 @@ export default (router: Router, context: any) => {
       await database("directus_access")
         .where({ user: userId, policy: policyId })
         .delete();
+      await invalidatePermissionsCache();
       logger.info(`[payments] directus_access row deleted: user=${userId} policy=${policyId}`);
     } catch (err: any) {
       logger.error(`[payments] revokePolicyAccess failed: ${err.message}`);
