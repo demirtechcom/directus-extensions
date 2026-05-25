@@ -30,7 +30,7 @@ export default (router: Router, context: any) => {
   // Plan adına göre atanacak Directus policy ID'si.
   // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
   const PLAN_POLICY_MAP: Record<string, string> = {
-    "Customer Pro": String(env["BUSINESS_POLICY_ID"] || ""),
+    "Delivr Pro Aylık": String(env["BUSINESS_POLICY_ID"] || ""),
   };
 
   if (!env["BUSINESS_POLICY_ID"]) {
