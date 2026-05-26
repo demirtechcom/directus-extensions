@@ -27,16 +27,13 @@ export default (router: Router, context: any) => {
     }
   }
 
-  // Plan adına göre atanacak Directus policy ID'si.
-  // Yeni paket eklenirse buraya da eklenmeli; UUID'ler env'den okunur.
-  const PLAN_POLICY_MAP: Record<string, string> = {
-    "Delivr Pro Aylık": String(env["BUSINESS_POLICY_ID"] || ""),
-  };
+  const BUSINESS_ROLE_ID = String(env["BUSINESS_ROLE_ID"] || "");
+  const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
 
-  if (!env["BUSINESS_POLICY_ID"]) {
-    logger.warn("[payments] BUSINESS_POLICY_ID is not set — subscription policy grants will be skipped");
+  if (!BUSINESS_ROLE_ID) {
+    logger.warn("[payments] BUSINESS_ROLE_ID is not set — role grants will be skipped");
   } else {
-    logger.info(`[payments] BUSINESS_POLICY_ID loaded: ${String(env["BUSINESS_POLICY_ID"]).slice(0, 8)}...`);
+    logger.info(`[payments] BUSINESS_ROLE_ID loaded: ${BUSINESS_ROLE_ID.slice(0, 8)}...`);
   }
 
   // --- Shared helpers ---
@@ -54,37 +51,32 @@ export default (router: Router, context: any) => {
     };
   }
 
-  async function grantPolicyAccess(userId: string, policyId: string) {
+  async function grantBusinessRole(userId: string) {
+    if (!BUSINESS_ROLE_ID) {
+      logger.warn(`[payments] BUSINESS_ROLE_ID not set, skipping role grant for user=${userId}`);
+      return;
+    }
     try {
-      const existing = await database("directus_access")
-        .where({ user: userId, policy: policyId })
-        .first();
-      if (!existing) {
-        await database("directus_access").insert({
-          id: crypto.randomUUID(),
-          user: userId,
-          policy: policyId,
-        });
-        await invalidatePermissionsCache();
-        logger.info(`[payments] directus_access row inserted: user=${userId} policy=${policyId}`);
-      } else {
-        logger.info(`[payments] directus_access already exists: user=${userId} policy=${policyId}`);
-      }
+      await database("directus_users").where({ id: userId }).update({ role: BUSINESS_ROLE_ID });
+      await invalidatePermissionsCache();
+      logger.info(`[payments] role updated to Business: user=${userId}`);
     } catch (err: any) {
-      logger.error(`[payments] grantPolicyAccess failed: ${err.message}`);
+      logger.error(`[payments] grantBusinessRole failed: ${err.message}`);
       throw err;
     }
   }
 
-  async function revokePolicyAccess(userId: string, policyId: string) {
+  async function revokeBusinessRole(userId: string) {
+    if (!DEFAULT_ROLE_ID) {
+      logger.warn(`[payments] SSO_DEFAULT_ROLE_ID not set, skipping role revoke for user=${userId}`);
+      return;
+    }
     try {
-      await database("directus_access")
-        .where({ user: userId, policy: policyId })
-        .delete();
+      await database("directus_users").where({ id: userId }).update({ role: DEFAULT_ROLE_ID });
       await invalidatePermissionsCache();
-      logger.info(`[payments] directus_access row deleted: user=${userId} policy=${policyId}`);
+      logger.info(`[payments] role reverted to default: user=${userId}`);
     } catch (err: any) {
-      logger.error(`[payments] revokePolicyAccess failed: ${err.message}`);
+      logger.error(`[payments] revokeBusinessRole failed: ${err.message}`);
       throw err;
     }
   }
@@ -117,17 +109,11 @@ export default (router: Router, context: any) => {
 
     await usersService.updateOne(userId, userUpdate);
 
-    const plan = await plansService.readOne(planId, { fields: ["name"] });
-    logger.info(`[payments] activateSubscription planId=${planId} planName=${plan?.name}`);
-    const targetPolicyId = plan?.name ? PLAN_POLICY_MAP[plan.name] : "";
-    if (targetPolicyId) {
-      await grantPolicyAccess(userId, targetPolicyId);
-    } else {
-      logger.warn(`[payments] no policy mapped for plan "${plan?.name}" — check PLAN_POLICY_MAP and BUSINESS_POLICY_ID`);
-    }
+    logger.info(`[payments] activateSubscription planId=${planId} userId=${userId}`);
+    await grantBusinessRole(userId);
   }
 
-  async function deactivateSubscription(userId: string, planName: string) {
+  async function deactivateSubscription(userId: string) {
     const schema = await getSchema();
     const usersService = new services.UsersService({ schema, accountability: { admin: true } });
 
@@ -136,11 +122,7 @@ export default (router: Router, context: any) => {
       subscription_expires_at: null,
     });
 
-    const targetPolicyId = PLAN_POLICY_MAP[planName];
-    if (targetPolicyId) {
-      await revokePolicyAccess(userId, targetPolicyId);
-      logger.info(`[payments] policy revoked userId=${userId} planName=${planName} policy=${targetPolicyId}`);
-    }
+    await revokeBusinessRole(userId);
   }
 
   async function findPendingPayment(merchantOid: string) {
@@ -324,7 +306,7 @@ export default (router: Router, context: any) => {
       if (lastPayment.length > 0) {
         const plan = await plansService.readOne(lastPayment[0].plan_id, { fields: ["name"] });
         if (plan?.name) {
-          await deactivateSubscription(userId, plan.name);
+          await deactivateSubscription(userId);
         }
       }
 
