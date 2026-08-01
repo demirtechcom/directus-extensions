@@ -15,25 +15,23 @@ function getClientIp(req: any): string {
 }
 
 export default (router: Router, context: any) => {
-  const { env, services, getSchema, database, logger, getCache } = context;
-  const { cache, systemCache } = getCache?.() ?? {};
-
-  async function invalidatePermissionsCache() {
-    try {
-      await cache?.clear();
-      await systemCache?.clear();
-    } catch (err: any) {
-      logger.warn(`[payments] cache invalidation failed: ${err.message}`);
-    }
-  }
+  const { env, services, getSchema, logger } = context;
 
   const BUSINESS_ROLE_ID = String(env["BUSINESS_ROLE_ID"] || "");
   const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
 
-  if (!BUSINESS_ROLE_ID) {
-    logger.warn("[payments] BUSINESS_ROLE_ID is not set — role grants will be skipped");
-  } else {
+  // Logged at error level on purpose: a missing role id means paid users silently
+  // keep their free-tier permissions, which is worse than a noisy boot.
+  if (BUSINESS_ROLE_ID) {
     logger.info(`[payments] BUSINESS_ROLE_ID loaded: ${BUSINESS_ROLE_ID.slice(0, 8)}...`);
+  } else {
+    logger.error("[payments] BUSINESS_ROLE_ID is not set — paid users will NOT receive Business access");
+  }
+
+  if (DEFAULT_ROLE_ID) {
+    logger.info(`[payments] SSO_DEFAULT_ROLE_ID loaded: ${DEFAULT_ROLE_ID.slice(0, 8)}...`);
+  } else {
+    logger.error("[payments] SSO_DEFAULT_ROLE_ID is not set — cancellations will NOT revert the role");
   }
 
   // --- Shared helpers ---
@@ -51,36 +49,6 @@ export default (router: Router, context: any) => {
     };
   }
 
-  async function grantBusinessRole(userId: string) {
-    if (!BUSINESS_ROLE_ID) {
-      logger.warn(`[payments] BUSINESS_ROLE_ID not set, skipping role grant for user=${userId}`);
-      return;
-    }
-    try {
-      await database("directus_users").where({ id: userId }).update({ role: BUSINESS_ROLE_ID });
-      await invalidatePermissionsCache();
-      logger.info(`[payments] role updated to Business: user=${userId}`);
-    } catch (err: any) {
-      logger.error(`[payments] grantBusinessRole failed: ${err.message}`);
-      throw err;
-    }
-  }
-
-  async function revokeBusinessRole(userId: string) {
-    if (!DEFAULT_ROLE_ID) {
-      logger.warn(`[payments] SSO_DEFAULT_ROLE_ID not set, skipping role revoke for user=${userId}`);
-      return;
-    }
-    try {
-      await database("directus_users").where({ id: userId }).update({ role: DEFAULT_ROLE_ID });
-      await invalidatePermissionsCache();
-      logger.info(`[payments] role reverted to default: user=${userId}`);
-    } catch (err: any) {
-      logger.error(`[payments] revokeBusinessRole failed: ${err.message}`);
-      throw err;
-    }
-  }
-
   async function activateSubscription(
     userId: string,
     planId: number,
@@ -91,8 +59,32 @@ export default (router: Router, context: any) => {
     const schema = await getSchema();
     const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
     const usersService = new services.UsersService({ schema, accountability: { admin: true } });
-    const plansService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
 
+    // The role goes through UsersService rather than a raw Knex update so that
+    // Directus invalidates its own permission caches. Directus only applies
+    // role-level policies to JWT-authenticated requests, so the role — not a
+    // user-level directus_access row — is what actually grants the entitlement.
+    const userUpdate: Record<string, any> = {
+      subscription_tier: "pro",
+      subscription_expires_at: new Date(Date.now() + SUBSCRIPTION_DURATION_MS).toISOString(),
+    };
+    if (BUSINESS_ROLE_ID) {
+      userUpdate.role = BUSINESS_ROLE_ID;
+    } else {
+      logger.error(`[payments] BUSINESS_ROLE_ID missing — activating without Business role: user=${userId}`);
+    }
+    if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
+    if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
+
+    await usersService.updateOne(userId, userUpdate);
+
+    if (userUpdate.role) {
+      logger.info(`[payments] role updated to Business: user=${userId}`);
+    }
+
+    // Marked success last. While the row is still `pending`, both the webhook retry
+    // and /check-status will re-run this function; flipping it first would make any
+    // failure above permanent, since both paths skip already-processed payments.
     await paymentsService.updateOne(paymentId, {
       payment_status: "success",
       payment_type: paymentType,
@@ -100,32 +92,31 @@ export default (router: Router, context: any) => {
       stored_card_token: cardTokens.cardToken || null,
     });
 
-    const userUpdate: Record<string, any> = {
-      subscription_tier: "pro",
-      subscription_expires_at: new Date(Date.now() + SUBSCRIPTION_DURATION_MS).toISOString(),
-    };
-    if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
-    if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
-
-    await usersService.updateOne(userId, userUpdate);
-
-    logger.info(`[payments] activateSubscription planId=${planId} userId=${userId}`);
-    await grantBusinessRole(userId);
+    logger.info(`[payments] activateSubscription complete planId=${planId} userId=${userId}`);
   }
 
   async function deactivateSubscription(userId: string) {
     const schema = await getSchema();
     const usersService = new services.UsersService({ schema, accountability: { admin: true } });
 
-    await usersService.updateOne(userId, {
+    const userUpdate: Record<string, any> = {
       subscription_tier: null,
       subscription_expires_at: null,
-    });
+    };
+    if (DEFAULT_ROLE_ID) {
+      userUpdate.role = DEFAULT_ROLE_ID;
+    } else {
+      logger.error(`[payments] SSO_DEFAULT_ROLE_ID missing — subscription cancelled but role left as Business: user=${userId}`);
+    }
 
-    await revokeBusinessRole(userId);
+    await usersService.updateOne(userId, userUpdate);
+
+    if (userUpdate.role) {
+      logger.info(`[payments] role reverted to default: user=${userId}`);
+    }
   }
 
-  async function findPendingPayment(merchantOid: string) {
+  async function findPayment(merchantOid: string) {
     const schema = await getSchema();
     const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
 
@@ -236,6 +227,16 @@ export default (router: Router, context: any) => {
       const merchantOid = req.query.merchant_oid;
       if (!merchantOid) return res.status(400).json({ error: "merchant_oid is required" });
 
+      const payment = await findPayment(merchantOid);
+      if (!payment) {
+        logger.warn(`[payments] check-status: no payment found for merchant_oid=${merchantOid}`);
+        return res.status(404).json({ error: "Payment not found" });
+      }
+      if (payment.user_id !== userId) {
+        logger.warn(`[payments] check-status: user=${userId} requested payment owned by user=${payment.user_id}`);
+        return res.status(403).json({ error: "Forbidden" });
+      }
+
       const config = getPayTRConfig();
       const paytrToken = hmacSha256Base64(
         config.merchantKey,
@@ -257,13 +258,7 @@ export default (router: Router, context: any) => {
       logger.info(`[payments] check-status paytr response: status=${statusRes.status} odeme_tipi=${statusRes.odeme_tipi}`);
 
       if (statusRes.status !== "success") {
-        return res.json({ payment_status: "pending" });
-      }
-
-      const payment = await findPendingPayment(merchantOid);
-      if (!payment) {
-        logger.warn(`[payments] check-status: no payment found for merchant_oid=${merchantOid}`);
-        return res.json({ payment_status: "success" });
+        return res.json({ payment_status: "pending", role_updated: false });
       }
 
       logger.info(`[payments] check-status payment found — id=${payment.id} status=${payment.payment_status}`);
@@ -273,7 +268,9 @@ export default (router: Router, context: any) => {
         logger.info(`[payments] activated via check-status: ${merchantOid}`);
       }
 
-      return res.json({ payment_status: "success" });
+      // The role lives in the access-token claims minted by sso-exchange, so the
+      // client must call /sso-exchange/refresh before the new permissions apply.
+      return res.json({ payment_status: "success", role_updated: Boolean(BUSINESS_ROLE_ID) });
     } catch (err: any) {
       logger.error(`[payments] check-status error: ${err.message}\n${err.stack}`);
       return res.status(500).json({ error: "Status check failed" });
@@ -294,23 +291,9 @@ export default (router: Router, context: any) => {
         return res.status(400).json({ error: "No active subscription" });
       }
 
-      const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
-      const plansService = new services.ItemsService("subscription_plans", { schema, accountability: { admin: true } });
-      const lastPayment = await paymentsService.readByQuery({
-        filter: { user_id: { _eq: userId }, payment_status: { _eq: "success" } },
-        sort: ["-date_created"],
-        fields: ["plan_id"],
-        limit: 1,
-      });
+      await deactivateSubscription(userId);
 
-      if (lastPayment.length > 0) {
-        const plan = await plansService.readOne(lastPayment[0].plan_id, { fields: ["name"] });
-        if (plan?.name) {
-          await deactivateSubscription(userId);
-        }
-      }
-
-      return res.json({ success: true });
+      return res.json({ success: true, role_updated: Boolean(DEFAULT_ROLE_ID) });
     } catch (err: any) {
       logger.error(`[payments] cancel error: ${err.message}\n${err.stack}`);
       return res.status(500).json({ error: "Cancellation failed" });
@@ -345,7 +328,7 @@ export default (router: Router, context: any) => {
 
       logger.info(`[payments] hash verified for ${merchant_oid}`);
 
-      const payment = await findPendingPayment(merchant_oid);
+      const payment = await findPayment(merchant_oid);
       if (!payment) {
         logger.warn(`[payments] no payment record found for merchant_oid=${merchant_oid}`);
         return res.send("OK");
@@ -375,6 +358,8 @@ export default (router: Router, context: any) => {
 
       return res.send("OK");
     } catch (err: any) {
+      // Always 200 OK: PayTR retries on anything else, and the payment row is left
+      // `pending` above, so a retry re-runs activation instead of skipping it.
       logger.error(`[payments] callback error: ${err.message}\n${err.stack}`);
       return res.send("OK");
     }

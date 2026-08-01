@@ -30,11 +30,15 @@ Response:
 ### GET /payments/check-status?merchant_oid=DLVR...
 
 Queries the payment provider's status API and updates the payment record + subscription on success.
+Returns `403` if the payment belongs to another user, `404` if `merchant_oid` is unknown.
 
 Response:
 ```json
-{ "payment_status": "success" }
+{ "payment_status": "success", "role_updated": true }
 ```
+
+`role_updated: true` means the user's role changed server-side; the client must call
+`/sso-exchange/refresh` for the new permissions to apply to its access token.
 
 ### POST /payments/callback
 
@@ -98,30 +102,56 @@ Set these on your Directus instance. Provider credentials stay provider-specific
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `PAYMENTS_APP_URL` | No | Web app URL for redirects (default: `http://localhost:8081`) |
+| `BUSINESS_ROLE_ID` | Yes | Directus role ID granted on successful payment |
+| `SSO_DEFAULT_ROLE_ID` | Yes | Directus role ID restored on cancellation (shared with `sso-exchange`) |
 
 > **Security:** Merchant keys and salts are secrets. Never expose them client-side.
 
+## Subscription → role model
+
+Entitlement is carried by the user's **role**, not by a user-level policy:
+
+- Payment succeeds → `directus_users.role` becomes `BUSINESS_ROLE_ID`, `subscription_tier` becomes `pro`
+- Subscription cancelled → role reverts to `SSO_DEFAULT_ROLE_ID`, `subscription_tier` cleared
+
+Two things this depends on:
+
+1. **The Business role must have policies attached** (`directus_access` rows with `role = BUSINESS_ROLE_ID`).
+   A role with no policies grants nothing, so the swap would be a no-op.
+2. **Directus only applies role-level policies to JWT-authenticated requests.** Granting a policy
+   directly to a user via `directus_access` does not work for app traffic — that approach was tried
+   and reverted.
+
+The role is baked into the access-token claims minted by `sso-exchange`, so a role change does not
+affect an already-issued token. `/check-status` returns `role_updated: true` on success; the client
+should call `/sso-exchange/refresh` when it sees that, otherwise the new permissions only take
+effect once the access token expires (`ACCESS_TOKEN_TTL`, default 15m).
+
 ## Installation
 
-### Kubernetes (init container)
+### Kubernetes (ConfigMap)
 
-```yaml
-initContainers:
-  - name: fetch-extensions
-    image: alpine:3
-    command:
-      - sh
-      - -c
-      - |
-        mkdir -p /extensions/payments/dist
-        wget -O /extensions/payments/dist/index.js \
-          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/payments/dist/index.js"
-        wget -O /extensions/payments/package.json \
-          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/payments/package.json"
-    volumeMounts:
-      - name: extensions
-        mountPath: /extensions
+The Directus pod mounts the built bundles from the `directus-extensions` ConfigMap, so the pod
+needs no public internet egress. The ConfigMap lives in the infrastructure repo at
+`manifests/delivery-platform/directus-extensions-configmap.yaml`.
+
+**A source change is not live until the ConfigMap is regenerated and the pod restarts.** After
+editing `src/index.ts`:
+
+```bash
+npm run build                      # regenerate dist/index.js
+# then, in the infrastructure repo:
+./scripts/sync-directus-extensions.sh
+kubectl apply -f manifests/delivery-platform/directus-extensions-configmap.yaml
+kubectl -n delivery-platform rollout restart deploy/directus
 ```
+
+`EXTENSIONS_AUTO_RELOAD=false`, so `kubectl apply` alone does nothing — the restart is required.
+Run `./scripts/sync-directus-extensions.sh --check` to verify the ConfigMap matches the built
+bundles; it exits non-zero when they have drifted.
+
+Commit `src/` and `dist/` together — nothing enforces the build step, and a commit that updates
+only `src/` silently ships stale code.
 
 ### Manual
 
