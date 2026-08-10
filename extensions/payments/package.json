@@ -10,8 +10,9 @@
     "host": "^11.0.0"
   },
   "scripts": {
-    "build": "npx @directus/extensions-sdk build",
-    "dev": "npx @directus/extensions-sdk build -w"
+    "build": "bunx @directus/extensions-sdk build",
+    "dev": "bunx @directus/extensions-sdk build -w",
+    "test": "bun test"
   },
   "devDependencies": {
     "@directus/extensions-sdk": "^13.0.0",
