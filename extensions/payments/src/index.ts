@@ -1,6 +1,8 @@
 import type { Router } from "express";
 import crypto from "crypto";
 
+import { registerOrderIntake } from "./order-intake.js";
+
 const SUBSCRIPTION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const CURRENCY_MAP: Record<string, string> = { TRY: "TL", USD: "USD", EUR: "EUR", GBP: "GBP" };
 
@@ -19,6 +21,8 @@ export default (router: Router, context: any) => {
 
   const BUSINESS_ROLE_ID = String(env["BUSINESS_ROLE_ID"] || "");
   const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
+
+  registerOrderIntake(router, context);
 
   // Logged at error level on purpose: a missing role id means paid users silently
   // keep their free-tier permissions, which is worse than a noisy boot.

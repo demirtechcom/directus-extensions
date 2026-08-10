@@ -9,6 +9,7 @@ Directus endpoint extension for subscription payments. Currently supports [PayTR
 | `POST` | `/payments/get-token` | Required | Generate payment iframe token |
 | `GET` | `/payments/check-status` | Required | Check payment status via provider API |
 | `POST` | `/payments/callback` | Public | Webhook called by payment provider |
+| `POST` | `/payments/orders` | Conditional | Atomically create an idempotent Delivr order |
 | `GET` | `/payments/ok` | Public | Browser redirect after successful payment |
 | `GET` | `/payments/fail` | Public | Browser redirect after failed payment |
 
@@ -43,6 +44,48 @@ Response:
 ### POST /payments/callback
 
 Called by the payment provider after payment completes. Verifies the HMAC-SHA256 hash, updates the payment record, and activates the user's subscription. Must return plain text `OK`.
+
+### POST /payments/orders
+
+Creates the order, its line items, and (for QR, WhatsApp, and direct orders) its
+business-collected payment record in one database transaction. Prices and the
+total are loaded from published products on the server; client-supplied prices
+are not accepted. `client_request_id` is a UUID idempotency key and must be
+reused when retrying an uncertain request.
+
+Customer sources (`qr_table`, `whatsapp`) may be submitted without a session.
+Business and marketplace sources require an authenticated user assigned to the
+submitted venue.
+
+Request:
+
+```json
+{
+  "client_request_id": "c66c8d41-e3ec-4cf4-b63e-cbae1b82fb22",
+  "venue_id": 12,
+  "table_id": 31,
+  "table_number": 4,
+  "order_source": "qr_table",
+  "customer_name": "Ada",
+  "customer_phone": null,
+  "note": "No onions",
+  "order_items": [{ "product_id": 71, "quantity": 2 }]
+}
+```
+
+Created response (`201`) or idempotent replay (`200`):
+
+```json
+{
+  "outcome": "created",
+  "client_request_id": "c66c8d41-e3ec-4cf4-b63e-cbae1b82fb22",
+  "order": { "id": 842, "order_status": "pending", "total_amount": 250 }
+}
+```
+
+Validation and authorization failures are definitive `4xx` responses with a
+stable `error.code`. A `5xx` response is deliberately ambiguous to clients,
+which should retry with the same `client_request_id` before claiming failure.
 
 ## Required Directus Collections
 
@@ -136,10 +179,10 @@ needs no public internet egress. The ConfigMap lives in the infrastructure repo 
 `manifests/delivery-platform/directus-extensions-configmap.yaml`.
 
 **A source change is not live until the ConfigMap is regenerated and the pod restarts.** After
-editing `src/index.ts`:
+editing the extension source:
 
 ```bash
-npm run build                      # regenerate dist/index.js
+bun run build                      # regenerate dist/index.js
 # then, in the infrastructure repo:
 ./scripts/sync-directus-extensions.sh
 kubectl apply -f manifests/delivery-platform/directus-extensions-configmap.yaml
@@ -157,8 +200,8 @@ only `src/` silently ships stale code.
 
 ```bash
 cd extensions/payments
-npm install
-npm run build
+bun install
+bun run build
 ```
 
 Copy `dist/` and `package.json` to your Directus extensions directory.
