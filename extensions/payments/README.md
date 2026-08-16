@@ -170,6 +170,33 @@ affect an already-issued token. `/check-status` returns `role_updated: true` on 
 should call `/sso-exchange/refresh` when it sees that, otherwise the new permissions only take
 effect once the access token expires (`ACCESS_TOKEN_TTL`, default 15m).
 
+## Renewal period
+
+A successful payment writes the period in two places, inside one transaction:
+
+| Target | Field | Value |
+|--------|-------|-------|
+| `directus_users` | `subscription_expires_at` | `max(now, current expiry) + plan.duration_days` |
+| `subscriptions` (per venue) | `start_date` / `end_date` | period start kept while running, end = the new expiry |
+| `subscriptions` | `last_payment_id` | the payment that bought the period |
+
+Two rules this encodes:
+
+1. **A renewal stacks.** Paying five days before expiry leaves 35 days, not 30. Replacing the
+   expiry with `now + 30 days` silently charged early renewers for days they already owned.
+2. **The period length comes from `subscription_plans.duration_days`,** not from a constant, so a
+   yearly or trial plan does not need a code change.
+
+The transaction claims the payment row with `SELECT … FOR UPDATE WHERE payment_status = 'pending'`.
+Both the provider callback and the client's `/check-status` poll reach this path for the same
+payment; without the claim, a stacking renewal could be applied twice.
+
+A business that pays before its venue record exists gets the user-level entitlement only — that is
+what gates the app. The `subscriptions` row is written on the next payment after onboarding.
+
+**Expiry is not handled here.** Downgrading a lapsed account and warning before expiry belong to the
+[`subscription-lifecycle`](../subscription-lifecycle/) hook.
+
 ## Installation
 
 ### Kubernetes (ConfigMap)
