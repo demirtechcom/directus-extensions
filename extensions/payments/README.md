@@ -172,7 +172,7 @@ effect once the access token expires (`ACCESS_TOKEN_TTL`, default 15m).
 
 ## Renewal period
 
-A successful payment writes the period in two places, inside one transaction:
+A successful payment writes the period in two places:
 
 | Target | Field | Value |
 |--------|-------|-------|
@@ -187,12 +187,17 @@ Two rules this encodes:
 2. **The period length comes from `subscription_plans.duration_days`,** not from a constant, so a
    yearly or trial plan does not need a code change.
 
-The transaction claims the payment row with `SELECT … FOR UPDATE WHERE payment_status = 'pending'`.
-Both the provider callback and the client's `/check-status` poll reach this path for the same
-payment; without the claim, a stacking renewal could be applied twice.
+The user record and the payment status move together in one transaction that claims the payment row
+with `SELECT … FOR UPDATE WHERE payment_status = 'pending'`. Both the provider callback and the
+client's `/check-status` poll reach this path for the same payment; without the claim, a stacking
+renewal could be applied twice.
 
-A business that pays before its venue record exists gets the user-level entitlement only — that is
-what gates the app. The `subscriptions` row is written on the next payment after onboarding.
+The `subscriptions` row is mirrored **after** that transaction commits, and its failures are logged
+rather than raised. It is bookkeeping the daily sweep and the reconcile script read, while the user
+record is what gates the app — a stale `venue_id` must not cost a paying customer their entitlement.
+A business that pays before its venue record exists gets the user-level entitlement only; the venue
+row follows on the next payment after onboarding, or from
+`packages/directus-migrate/backfill-subscriptions.ts` in the delivr repo.
 
 **Expiry is not handled here.** Downgrading a lapsed account and warning before expiry belong to the
 [`subscription-lifecycle`](../subscription-lifecycle/) hook.

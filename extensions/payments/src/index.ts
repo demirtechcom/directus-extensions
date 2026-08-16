@@ -66,14 +66,67 @@ export default (router: Router, context: any) => {
   }
 
   /**
-   * Applies a successful payment: entitlement on the user, a paid period on the
-   * venue's `subscriptions` row, and the payment marked `success` last.
+   * Mirrors the period onto the venue's `subscriptions` row.
    *
-   * The whole thing runs in one transaction that claims the still-pending
-   * payment row with `FOR UPDATE`. Both the provider callback and the client's
+   * Deliberately outside the activation transaction and swallowing its own
+   * errors: this row is bookkeeping that the sweep and the reconcile script
+   * read, while the user record is what actually gates the app. A venue row
+   * that cannot be written — a stale `venue_id`, a schema change — must never
+   * cost a paying customer their entitlement, and rolling the activation back
+   * would leave the payment `pending` with nothing granted.
+   */
+  async function recordSubscriptionPeriod(
+    schema: unknown,
+    venueId: number,
+    planId: number,
+    paymentId: number,
+    expiry: Date,
+    nowMs: number,
+  ): Promise<void> {
+    try {
+      const subscriptionsService = new services.ItemsService("subscriptions", {
+        schema,
+        accountability: { admin: true },
+      });
+
+      const rows: SubscriptionRow[] = await subscriptionsService.readByQuery({
+        filter: { venue_id: { _eq: venueId } },
+        fields: ["id", "start_date", "end_date", "last_payment_id"],
+        sort: ["-end_date"],
+        limit: 1,
+      });
+      const existing = rows[0] ?? null;
+
+      if (isPaymentAlreadyApplied(existing, paymentId)) {
+        logger.info(`[payments] subscription already carries payment=${paymentId}`);
+        return;
+      }
+
+      const payload = buildSubscriptionPayload(existing, planId, paymentId, expiry, nowMs);
+      if (existing) {
+        await subscriptionsService.updateOne(existing.id, payload);
+      } else {
+        await subscriptionsService.createOne({ venue_id: venueId, ...payload });
+      }
+
+      logger.info(`[payments] subscription period venue=${venueId} ends ${payload.end_date}`);
+    } catch (err: any) {
+      logger.error(
+        `[payments] subscription row not written for venue=${venueId} payment=${paymentId}: ${err.message}`,
+      );
+    }
+  }
+
+  /**
+   * Applies a successful payment: entitlement on the user and the payment
+   * marked `success`, in one transaction that claims the still-pending payment
+   * row with `FOR UPDATE`. Both the provider callback and the client's
    * /check-status poll reach this path for the same payment, and now that a
    * renewal stacks onto the remaining days, activating twice would hand out a
    * second period for free.
+   *
+   * The venue's `subscriptions` row is mirrored afterwards, outside the
+   * transaction — see recordSubscriptionPeriod.
    */
   async function activateSubscription(
     userId: string,
@@ -84,7 +137,7 @@ export default (router: Router, context: any) => {
   ): Promise<boolean> {
     const schema = await getSchema();
 
-    return database.transaction(async (trx: any) => {
+    const activated = await database.transaction(async (trx: any) => {
       const claimed = await trx("payments")
         .where({ id: paymentId, payment_status: "pending" })
         .forUpdate()
@@ -92,14 +145,13 @@ export default (router: Router, context: any) => {
 
       if (claimed.length === 0) {
         logger.info(`[payments] activation skipped, payment already applied: id=${paymentId}`);
-        return false;
+        return null;
       }
 
       const options = { schema, knex: trx, accountability: { admin: true } };
       const paymentsService = new services.ItemsService("payments", options);
       const usersService = new services.UsersService(options);
       const plansService = new services.ItemsService("subscription_plans", options);
-      const subscriptionsService = new services.ItemsService("subscriptions", options);
 
       const user = await usersService.readOne(userId, {
         fields: ["id", "venue_id", "subscription_expires_at"],
@@ -132,34 +184,6 @@ export default (router: Router, context: any) => {
         logger.info(`[payments] role updated to Business: user=${userId}`);
       }
 
-      const venueId = normalizeId(user?.venue_id);
-      if (venueId === null) {
-        // Businesses can pay before their venue record exists, so this is not an
-        // error. The user-level entitlement above is what gates the app; the
-        // venue row gets its period on the next payment after onboarding.
-        logger.warn(`[payments] user=${userId} has no venue — subscription row not written`);
-      } else {
-        const rows: SubscriptionRow[] = await subscriptionsService.readByQuery({
-          filter: { venue_id: { _eq: venueId } },
-          fields: ["id", "start_date", "end_date", "last_payment_id"],
-          sort: ["-end_date"],
-          limit: 1,
-        });
-        const existing = rows[0] ?? null;
-
-        if (isPaymentAlreadyApplied(existing, paymentId)) {
-          logger.info(`[payments] subscription already carries payment=${paymentId}`);
-        } else {
-          const payload = buildSubscriptionPayload(existing, planId, paymentId, expiry, nowMs);
-          if (existing) {
-            await subscriptionsService.updateOne(existing.id, payload);
-          } else {
-            await subscriptionsService.createOne({ venue_id: venueId, ...payload });
-          }
-          logger.info(`[payments] subscription period venue=${venueId} ends ${payload.end_date}`);
-        }
-      }
-
       // Marked success last. While the row is still `pending`, both the webhook
       // retry and /check-status will re-run this function; flipping it first
       // would make any failure above permanent, since both paths skip
@@ -174,8 +198,29 @@ export default (router: Router, context: any) => {
       logger.info(
         `[payments] activateSubscription complete planId=${planId} userId=${userId} expires=${expiry.toISOString()}`,
       );
-      return true;
+
+      return { venueId: normalizeId(user?.venue_id), expiry, nowMs };
     });
+
+    if (!activated) return false;
+
+    if (activated.venueId === null) {
+      // Businesses can pay before their venue record exists, so this is not an
+      // error. The user-level entitlement is what gates the app; the venue row
+      // gets its period on the next payment after onboarding.
+      logger.warn(`[payments] user=${userId} has no venue — subscription row not written`);
+    } else {
+      await recordSubscriptionPeriod(
+        schema,
+        activated.venueId,
+        planId,
+        paymentId,
+        activated.expiry,
+        activated.nowMs,
+      );
+    }
+
+    return true;
   }
 
   async function deactivateSubscription(userId: string) {
