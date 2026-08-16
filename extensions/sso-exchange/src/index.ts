@@ -53,9 +53,28 @@ function verifyAppleToken(
 
 // --- Google token verification ---
 
+/**
+ * The Google OAuth client ids whose tokens this instance accepts.
+ *
+ * A list rather than one value because this Directus is shared by several products, and a
+ * Google id token's `aud` is the web client id of the project that minted it. One product per
+ * project is what keeps each app's OAuth consent screen — its name, logo and privacy link —
+ * its own; the cost is that there is no longer a single audience to compare against.
+ *
+ * Reads SSO_GOOGLE_CLIENT_IDS (comma separated) and falls back to the older singular
+ * SSO_GOOGLE_CLIENT_ID, so an instance that has not been updated keeps working unchanged.
+ */
+function allowedGoogleAudiences(env: any): string[] {
+  const raw = env.SSO_GOOGLE_CLIENT_IDS || env.SSO_GOOGLE_CLIENT_ID || "";
+  return String(raw)
+    .split(",")
+    .map((id: string) => id.trim())
+    .filter(Boolean);
+}
+
 async function verifyGoogleToken(
   idToken: string,
-  expectedAudience: string,
+  expectedAudiences: string[],
 ): Promise<{ email: string; sub: string; given_name?: string; family_name?: string }> {
   const res = await fetch(
     `https://oauth2.googleapis.com/tokeninfo?id_token=${encodeURIComponent(idToken)}`,
@@ -73,7 +92,10 @@ async function verifyGoogleToken(
 
   if (!data.email) throw new Error("No email in Google token");
   if (data.email_verified !== "true") throw new Error("Google email not verified");
-  if (expectedAudience && data.aud !== expectedAudience) {
+  // An empty list still means "accept any audience", which is how this behaved before and is
+  // why the deployment must actually set the variable: without it, an id token minted for any
+  // Google application anywhere is exchanged for a session on this instance.
+  if (expectedAudiences.length > 0 && !expectedAudiences.includes(data.aud)) {
     throw new Error("Google token audience mismatch");
   }
 
@@ -559,8 +581,7 @@ export default (router: Router, context: any) => {
         if (clientGivenName) userinfo.given_name = clientGivenName;
         if (clientFamilyName) userinfo.family_name = clientFamilyName;
       } else {
-        const googleAudience = env.SSO_GOOGLE_CLIENT_ID || "";
-        userinfo = await verifyGoogleToken(token, googleAudience);
+        userinfo = await verifyGoogleToken(token, allowedGoogleAudiences(env));
       }
 
       const schema = await getSchema();

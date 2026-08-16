@@ -94,7 +94,8 @@ Set these in your Directus deployment:
 | Variable | Required | Description |
 |----------|----------|-------------|
 | `SECRET` | Yes | Directus secret (already set in Directus) |
-| `SSO_GOOGLE_CLIENT_ID` | For Google | Google Web Client ID for audience validation |
+| `SSO_GOOGLE_CLIENT_IDS` | For Google | Google **web** client ids whose tokens are accepted, comma separated — one per product sharing this instance. A native app puts its web client id in `webClientId`/`serverClientId`, so that is what lands in the token's `aud`; the iOS and Android client ids never appear here. **Leaving this empty disables the check entirely**, and an id token minted for any Google application anywhere is then exchanged for a session |
+| `SSO_GOOGLE_CLIENT_ID` | Deprecated | The former single-value form. Still read when `SSO_GOOGLE_CLIENT_IDS` is unset, so an instance can be upgraded without touching its config first |
 | `SSO_DEFAULT_ROLE_ID` | No | Directus role ID assigned to new users |
 | `SSO_WEB_ALLOWED_ORIGINS` | For web | Comma-separated allowed web app origins (e.g. `http://localhost:8081,https://app.example.com`) |
 | `AUTH_KEYCLOAK_REDIRECT_ALLOW_LIST` | For web | Must include the web-callback URL: `https://<DIRECTUS>/sso-exchange/web-callback` |
