@@ -42,11 +42,11 @@ initContainers:
 
 Mount the volume in the Directus container at `/directus/extensions`.
 
-> **DemirTech deployments do not use this.** The `delivery-platform` cluster mounts the bundles from
-> a ConfigMap instead, so the pod needs no public internet egress. A source change is not live until
-> the ConfigMap is regenerated and the pod restarted — see
-> [extensions/payments/README.md](extensions/payments/) and
-> `infastructure/scripts/sync-directus-extensions.sh`.
+> **DemirTech deployments do not use this.** Every one of our Directus instances mounts the bundles
+> from a ConfigMap instead, so no pod needs public internet egress and no pod silently picks up
+> whatever is on `main` when it restarts. A source change is not live until the ConfigMap is
+> regenerated and the pod restarted — see [extensions/payments/README.md](extensions/payments/) and
+> `infastructure/scripts/sync-directus-extensions.sh`, which generates one ConfigMap per instance.
 
 ## Development
 
