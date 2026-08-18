@@ -1,0 +1,23 @@
+{
+  "name": "subscription-lifecycle",
+  "version": "1.0.0",
+  "description": "Daily subscription sweep for Delivr: warns before expiry, downgrades lapsed accounts",
+  "type": "module",
+  "directus:extension": {
+    "type": "hook",
+    "path": "dist/index.js",
+    "source": "src/index.ts",
+    "host": "^11.0.0"
+  },
+  "scripts": {
+    "build": "bunx @directus/extensions-sdk build",
+    "dev": "bunx @directus/extensions-sdk build -w",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@directus/extensions-sdk": "^13.0.0",
+    "@types/node": "^25.9.1",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}

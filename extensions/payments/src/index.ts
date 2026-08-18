@@ -2,8 +2,14 @@ import type { Router } from "express";
 import crypto from "crypto";
 
 import { registerOrderIntake } from "./order-intake.js";
+import {
+  buildSubscriptionPayload,
+  computeExpiry,
+  isPaymentAlreadyApplied,
+  resolveDurationDays,
+  type SubscriptionRow,
+} from "./subscription.js";
 
-const SUBSCRIPTION_DURATION_MS = 30 * 24 * 60 * 60 * 1000; // 30 days
 const CURRENCY_MAP: Record<string, string> = { TRY: "TL", USD: "USD", EUR: "EUR", GBP: "GBP" };
 
 function hmacSha256Base64(key: string, data: string): string {
@@ -16,8 +22,14 @@ function getClientIp(req: any): string {
     .trim();
 }
 
+function normalizeId(value: any): number | null {
+  const raw = value !== null && typeof value === "object" ? value.id : value;
+  const id = Number(raw);
+  return Number.isInteger(id) && id > 0 ? id : null;
+}
+
 export default (router: Router, context: any) => {
-  const { env, services, getSchema, logger } = context;
+  const { env, services, getSchema, logger, database } = context;
 
   const BUSINESS_ROLE_ID = String(env["BUSINESS_ROLE_ID"] || "");
   const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
@@ -53,50 +65,162 @@ export default (router: Router, context: any) => {
     };
   }
 
+  /**
+   * Mirrors the period onto the venue's `subscriptions` row.
+   *
+   * Deliberately outside the activation transaction and swallowing its own
+   * errors: this row is bookkeeping that the sweep and the reconcile script
+   * read, while the user record is what actually gates the app. A venue row
+   * that cannot be written — a stale `venue_id`, a schema change — must never
+   * cost a paying customer their entitlement, and rolling the activation back
+   * would leave the payment `pending` with nothing granted.
+   */
+  async function recordSubscriptionPeriod(
+    schema: unknown,
+    venueId: number,
+    planId: number,
+    paymentId: number,
+    expiry: Date,
+    nowMs: number,
+  ): Promise<void> {
+    try {
+      const subscriptionsService = new services.ItemsService("subscriptions", {
+        schema,
+        accountability: { admin: true },
+      });
+
+      const rows: SubscriptionRow[] = await subscriptionsService.readByQuery({
+        filter: { venue_id: { _eq: venueId } },
+        fields: ["id", "start_date", "end_date", "last_payment_id"],
+        sort: ["-end_date"],
+        limit: 1,
+      });
+      const existing = rows[0] ?? null;
+
+      if (isPaymentAlreadyApplied(existing, paymentId)) {
+        logger.info(`[payments] subscription already carries payment=${paymentId}`);
+        return;
+      }
+
+      const payload = buildSubscriptionPayload(existing, planId, paymentId, expiry, nowMs);
+      if (existing) {
+        await subscriptionsService.updateOne(existing.id, payload);
+      } else {
+        await subscriptionsService.createOne({ venue_id: venueId, ...payload });
+      }
+
+      logger.info(`[payments] subscription period venue=${venueId} ends ${payload.end_date}`);
+    } catch (err: any) {
+      logger.error(
+        `[payments] subscription row not written for venue=${venueId} payment=${paymentId}: ${err.message}`,
+      );
+    }
+  }
+
+  /**
+   * Applies a successful payment: entitlement on the user and the payment
+   * marked `success`, in one transaction that claims the still-pending payment
+   * row with `FOR UPDATE`. Both the provider callback and the client's
+   * /check-status poll reach this path for the same payment, and now that a
+   * renewal stacks onto the remaining days, activating twice would hand out a
+   * second period for free.
+   *
+   * The venue's `subscriptions` row is mirrored afterwards, outside the
+   * transaction — see recordSubscriptionPeriod.
+   */
   async function activateSubscription(
     userId: string,
     planId: number,
     paymentId: number,
     paymentType: string | null,
     cardTokens: { userToken?: string; cardToken?: string },
-  ) {
+  ): Promise<boolean> {
     const schema = await getSchema();
-    const paymentsService = new services.ItemsService("payments", { schema, accountability: { admin: true } });
-    const usersService = new services.UsersService({ schema, accountability: { admin: true } });
 
-    // The role goes through UsersService rather than a raw Knex update so that
-    // Directus invalidates its own permission caches. Directus only applies
-    // role-level policies to JWT-authenticated requests, so the role — not a
-    // user-level directus_access row — is what actually grants the entitlement.
-    const userUpdate: Record<string, any> = {
-      subscription_tier: "pro",
-      subscription_expires_at: new Date(Date.now() + SUBSCRIPTION_DURATION_MS).toISOString(),
-    };
-    if (BUSINESS_ROLE_ID) {
-      userUpdate.role = BUSINESS_ROLE_ID;
-    } else {
-      logger.error(`[payments] BUSINESS_ROLE_ID missing — activating without Business role: user=${userId}`);
-    }
-    if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
-    if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
+    const activated = await database.transaction(async (trx: any) => {
+      const claimed = await trx("payments")
+        .where({ id: paymentId, payment_status: "pending" })
+        .forUpdate()
+        .select("id");
 
-    await usersService.updateOne(userId, userUpdate);
+      if (claimed.length === 0) {
+        logger.info(`[payments] activation skipped, payment already applied: id=${paymentId}`);
+        return null;
+      }
 
-    if (userUpdate.role) {
-      logger.info(`[payments] role updated to Business: user=${userId}`);
-    }
+      const options = { schema, knex: trx, accountability: { admin: true } };
+      const paymentsService = new services.ItemsService("payments", options);
+      const usersService = new services.UsersService(options);
+      const plansService = new services.ItemsService("subscription_plans", options);
 
-    // Marked success last. While the row is still `pending`, both the webhook retry
-    // and /check-status will re-run this function; flipping it first would make any
-    // failure above permanent, since both paths skip already-processed payments.
-    await paymentsService.updateOne(paymentId, {
-      payment_status: "success",
-      payment_type: paymentType,
-      stored_card_user_token: cardTokens.userToken || null,
-      stored_card_token: cardTokens.cardToken || null,
+      const user = await usersService.readOne(userId, {
+        fields: ["id", "venue_id", "subscription_expires_at"],
+      });
+      const plan = await plansService.readOne(planId, { fields: ["id", "duration_days"] });
+
+      const durationDays = resolveDurationDays(plan?.duration_days);
+      const nowMs = Date.now();
+      const expiry = computeExpiry(user?.subscription_expires_at, durationDays, nowMs);
+
+      // The role goes through UsersService rather than a raw Knex update so that
+      // Directus invalidates its own permission caches. Directus only applies
+      // role-level policies to JWT-authenticated requests, so the role — not a
+      // user-level directus_access row — is what actually grants the entitlement.
+      const userUpdate: Record<string, any> = {
+        subscription_tier: "pro",
+        subscription_expires_at: expiry.toISOString(),
+      };
+      if (BUSINESS_ROLE_ID) {
+        userUpdate.role = BUSINESS_ROLE_ID;
+      } else {
+        logger.error(`[payments] BUSINESS_ROLE_ID missing — activating without Business role: user=${userId}`);
+      }
+      if (cardTokens.userToken) userUpdate.stored_card_user_token = cardTokens.userToken;
+      if (cardTokens.cardToken) userUpdate.stored_card_token = cardTokens.cardToken;
+
+      await usersService.updateOne(userId, userUpdate);
+
+      if (userUpdate.role) {
+        logger.info(`[payments] role updated to Business: user=${userId}`);
+      }
+
+      // Marked success last. While the row is still `pending`, both the webhook
+      // retry and /check-status will re-run this function; flipping it first
+      // would make any failure above permanent, since both paths skip
+      // already-processed payments.
+      await paymentsService.updateOne(paymentId, {
+        payment_status: "success",
+        payment_type: paymentType,
+        stored_card_user_token: cardTokens.userToken || null,
+        stored_card_token: cardTokens.cardToken || null,
+      });
+
+      logger.info(
+        `[payments] activateSubscription complete planId=${planId} userId=${userId} expires=${expiry.toISOString()}`,
+      );
+
+      return { venueId: normalizeId(user?.venue_id), expiry, nowMs };
     });
 
-    logger.info(`[payments] activateSubscription complete planId=${planId} userId=${userId}`);
+    if (!activated) return false;
+
+    if (activated.venueId === null) {
+      // Businesses can pay before their venue record exists, so this is not an
+      // error. The user-level entitlement is what gates the app; the venue row
+      // gets its period on the next payment after onboarding.
+      logger.warn(`[payments] user=${userId} has no venue — subscription row not written`);
+    } else {
+      await recordSubscriptionPeriod(
+        schema,
+        activated.venueId,
+        planId,
+        paymentId,
+        activated.expiry,
+        activated.nowMs,
+      );
+    }
+
+    return true;
   }
 
   async function deactivateSubscription(userId: string) {
