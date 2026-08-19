@@ -7,6 +7,7 @@ import {
   buildWarningNotification,
   chunk,
   normalizeVenueId,
+  partitionRoleUpdates,
   selectUsersToWarn,
   type NotificationPayload,
   type SubscriberRow,
@@ -18,7 +19,9 @@ import {
  */
 const DEFAULT_CRON = "0 6 * * *";
 
-const USER_FIELDS = ["id", "venue_id", "subscription_expires_at", "push_token"];
+// `role` is read so the sweep can tell a business account apart from an admin one
+// before it rewrites anything. See partitionRoleUpdates.
+const USER_FIELDS = ["id", "venue_id", "subscription_expires_at", "push_token", "role"];
 
 interface HookEvents {
   schedule(cron: string, handler: () => Promise<void> | void): void;
@@ -28,6 +31,7 @@ export default ({ schedule }: HookEvents, context: any) => {
   const { env, services, getSchema, logger } = context;
 
   const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
+  const BUSINESS_ROLE_ID = String(env["BUSINESS_ROLE_ID"] || "");
   const WARNING_DAYS = Number(env["SUBSCRIPTION_WARNING_DAYS"] || DEFAULT_WARNING_DAYS);
   const CRON = String(env["SUBSCRIPTION_SWEEP_CRON"] || DEFAULT_CRON);
 
@@ -36,6 +40,15 @@ export default ({ schedule }: HookEvents, context: any) => {
     // thing that actually grants server-side access — would stay on the account.
     logger.error(
       "[subscriptions] SSO_DEFAULT_ROLE_ID is not set — expired accounts will keep their Business role",
+    );
+  }
+
+  if (!BUSINESS_ROLE_ID) {
+    // The same failure from the other side: without knowing which role a
+    // subscription grants, the sweep cannot tell a lapsed business from a lapsed
+    // administrator, so it revokes nothing rather than guessing.
+    logger.error(
+      "[subscriptions] BUSINESS_ROLE_ID is not set — expired accounts will keep whatever role they hold",
     );
   }
 
@@ -128,11 +141,32 @@ export default ({ schedule }: HookEvents, context: any) => {
 
     if (lapsed.length === 0) return 0;
 
-    const userUpdate: Record<string, any> = { subscription_tier: "free" };
-    if (DEFAULT_ROLE_ID) userUpdate.role = DEFAULT_ROLE_ID;
-    await users.updateMany(
-      lapsed.map((user) => user.id),
-      userUpdate,
+    // Every lapsed account loses the tier. Only the ones actually holding the
+    // business role lose the role, so a lapsed administrator keeps being an
+    // administrator - see partitionRoleUpdates for what this cost before.
+    const { demote, tierOnly } = partitionRoleUpdates(lapsed, BUSINESS_ROLE_ID);
+
+    if (tierOnly.length > 0) {
+      await users.updateMany(
+        tierOnly.map((user) => user.id),
+        { subscription_tier: "free" },
+      );
+    }
+
+    if (demote.length > 0 && DEFAULT_ROLE_ID) {
+      await users.updateMany(
+        demote.map((user) => user.id),
+        { subscription_tier: "free", role: DEFAULT_ROLE_ID },
+      );
+    } else if (demote.length > 0) {
+      await users.updateMany(
+        demote.map((user) => user.id),
+        { subscription_tier: "free" },
+      );
+    }
+
+    logger.info(
+      `[subscriptions] role revoked for ${demote.length} business account(s), tier only for ${tierOnly.length}`,
     );
 
     const venueIds = [...new Set(lapsed.map((user) => normalizeVenueId(user.venue_id)).filter(Boolean))];

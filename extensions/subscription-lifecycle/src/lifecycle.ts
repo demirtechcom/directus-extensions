@@ -15,6 +15,7 @@ export interface SubscriberRow {
   venue_id: number | { id: number } | null;
   subscription_expires_at: string | null;
   push_token?: string | null;
+  role?: string | { id: string } | null;
 }
 
 export interface NotificationPayload {
@@ -41,6 +42,43 @@ export function normalizeVenueId(value: SubscriberRow["venue_id"]): number | nul
   const raw = value !== null && typeof value === "object" ? value.id : value;
   const id = Number(raw);
   return Number.isInteger(id) && id > 0 ? id : null;
+}
+
+export function normalizeRoleId(value: SubscriberRow["role"]): string | null {
+  const raw = value !== null && typeof value === "object" ? value?.id : value;
+  return typeof raw === "string" && raw.length > 0 ? raw : null;
+}
+
+/**
+ * Splits the lapsed accounts into the ones whose role may be rewritten and the
+ * ones that only lose their tier.
+ *
+ * The sweep exists to revoke *business* entitlement, and its earlier form set
+ * `role = SSO_DEFAULT_ROLE_ID` on every lapsed account regardless of what role it
+ * held. On 2026-08-19 that demoted a Directus `Administrator` and a
+ * `Delivr Admin Role` account to `app user`, because both happened to carry
+ * `subscription_tier = 'pro'` with an expiry in the past. Dropping the tier is
+ * always correct; rewriting a role that was never granted by a subscription is not.
+ *
+ * An empty businessRoleId demotes nobody. That is the deliberate failure mode: a
+ * missing config leaves stale business access in place, which is visible and
+ * fixable, where the alternative silently rewrites every role in the cohort.
+ */
+export function partitionRoleUpdates(
+  users: SubscriberRow[],
+  businessRoleId: string,
+): { demote: SubscriberRow[]; tierOnly: SubscriberRow[] } {
+  if (!businessRoleId) return { demote: [], tierOnly: users };
+
+  const demote: SubscriberRow[] = [];
+  const tierOnly: SubscriberRow[] = [];
+
+  for (const user of users) {
+    if (normalizeRoleId(user.role) === businessRoleId) demote.push(user);
+    else tierOnly.push(user);
+  }
+
+  return { demote, tierOnly };
 }
 
 /**

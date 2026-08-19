@@ -6,10 +6,16 @@ import {
   buildWarningNotification,
   chunk,
   daysUntil,
+  normalizeRoleId,
   normalizeVenueId,
+  partitionRoleUpdates,
   selectUsersToWarn,
   type SubscriberRow,
 } from "./lifecycle";
+
+const BUSINESS_ROLE = "82975326-5ec3-4bec-aa72-2aadb2d48be9";
+const ADMIN_ROLE = "90b057e7-58f3-490c-a28f-132934291692";
+const APP_USER_ROLE = "821c72fe-661e-4a30-8647-d447de7649ef";
 
 const DAY = 24 * 60 * 60 * 1000;
 const now = Date.parse("2026-08-16T06:00:00.000Z");
@@ -23,6 +29,70 @@ function user(overrides: Partial<SubscriberRow> = {}): SubscriberRow {
     ...overrides,
   };
 }
+
+describe("normalizeRoleId", () => {
+  it("accepts both a raw id and an expanded relation", () => {
+    expect(normalizeRoleId(BUSINESS_ROLE)).toBe(BUSINESS_ROLE);
+    expect(normalizeRoleId({ id: BUSINESS_ROLE })).toBe(BUSINESS_ROLE);
+  });
+
+  it("returns null for a missing role", () => {
+    expect(normalizeRoleId(null)).toBeNull();
+    expect(normalizeRoleId(undefined)).toBeNull();
+    expect(normalizeRoleId("")).toBeNull();
+  });
+});
+
+describe("partitionRoleUpdates", () => {
+  it("revokes the role only from accounts holding the business role", () => {
+    const business = user({ id: "business", role: BUSINESS_ROLE });
+    const admin = user({ id: "admin", role: ADMIN_ROLE });
+    const appUser = user({ id: "app", role: APP_USER_ROLE });
+
+    const { demote, tierOnly } = partitionRoleUpdates(
+      [business, admin, appUser],
+      BUSINESS_ROLE,
+    );
+
+    expect(demote.map((u) => u.id)).toEqual(["business"]);
+    expect(tierOnly.map((u) => u.id)).toEqual(["admin", "app"]);
+  });
+
+  it("leaves an administrator alone - the 2026-08-19 regression", () => {
+    const admin = user({ id: "admin", role: ADMIN_ROLE });
+
+    const { demote } = partitionRoleUpdates([admin], BUSINESS_ROLE);
+
+    expect(demote).toEqual([]);
+  });
+
+  it("treats an expanded role relation the same as a raw id", () => {
+    const business = user({ id: "business", role: { id: BUSINESS_ROLE } });
+
+    const { demote } = partitionRoleUpdates([business], BUSINESS_ROLE);
+
+    expect(demote.map((u) => u.id)).toEqual(["business"]);
+  });
+
+  it("keeps a roleless account out of the demote set", () => {
+    const roleless = user({ id: "none", role: null });
+
+    const { demote, tierOnly } = partitionRoleUpdates([roleless], BUSINESS_ROLE);
+
+    expect(demote).toEqual([]);
+    expect(tierOnly.map((u) => u.id)).toEqual(["none"]);
+  });
+
+  it("demotes nobody when BUSINESS_ROLE_ID is unset, rather than everybody", () => {
+    const business = user({ id: "business", role: BUSINESS_ROLE });
+    const admin = user({ id: "admin", role: ADMIN_ROLE });
+
+    const { demote, tierOnly } = partitionRoleUpdates([business, admin], "");
+
+    expect(demote).toEqual([]);
+    expect(tierOnly.map((u) => u.id)).toEqual(["business", "admin"]);
+  });
+});
 
 describe("normalizeVenueId", () => {
   it("accepts both a raw id and an expanded relation", () => {
