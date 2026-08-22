@@ -1,0 +1,40 @@
+{
+  "name": "suvia",
+  "version": "1.0.0",
+  "description": "Suvia's server-authoritative logic: AI photo verification, challenge planning, leaderboard, photo retention",
+  "type": "module",
+  "directus:extension": {
+    "type": "bundle",
+    "path": {
+      "app": "dist/app.js",
+      "api": "dist/api.js"
+    },
+    "entries": [
+      {
+        "type": "endpoint",
+        "name": "suvia",
+        "source": "src/endpoint.ts"
+      },
+      {
+        "type": "hook",
+        "name": "suvia-purge",
+        "source": "src/purge.ts"
+      }
+    ],
+    "host": "^11.0.0"
+  },
+  "scripts": {
+    "build": "npx @directus/extensions-sdk build",
+    "test": "bun test src/__tests__",
+    "dev": "npx @directus/extensions-sdk build -w"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.112.3"
+  },
+  "devDependencies": {
+    "@directus/extensions-sdk": "^13.0.0",
+    "@types/express": "^5.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}
