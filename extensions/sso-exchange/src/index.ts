@@ -3,6 +3,9 @@ import { randomUUID, scrypt, randomBytes, timingSafeEqual } from "crypto";
 import { promisify } from "util";
 import jwt from "jsonwebtoken";
 
+// Avoid wildcard reads when Directus instances expose different custom user fields.
+const AUTH_USER_FIELDS = ["id", "role", "first_name", "last_name"];
+
 const scryptAsync = promisify(scrypt);
 
 async function hashPassword(password: string): Promise<string> {
@@ -196,6 +199,7 @@ export default (router: Router, context: any) => {
       const usersService = new UsersService({ schema, knex: database });
       const users = await usersService.readByQuery({
         filter: { id: { _eq: session.user } },
+        fields: AUTH_USER_FIELDS,
         limit: 1,
       });
 
@@ -282,6 +286,7 @@ export default (router: Router, context: any) => {
       const usersService = new UsersService({ schema, knex: database });
       const users = await usersService.readByQuery({
         filter: { id: { _eq: decoded.id } },
+        fields: AUTH_USER_FIELDS,
         limit: 1,
       });
 
@@ -590,6 +595,7 @@ export default (router: Router, context: any) => {
 
       let users = await usersService.readByQuery({
         filter: { email: { _eq: userinfo.email } },
+        fields: AUTH_USER_FIELDS,
         limit: 1,
       });
 
