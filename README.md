@@ -6,6 +6,7 @@ Open-source Directus extensions by [DemirTech](https://demirtech.com).
 
 | Extension | Type | Description |
 |-----------|------|-------------|
+| [guest-auth](extensions/guest-auth/) | Endpoint | Anonymous customer sessions for shipped Delivr clients |
 | [sso-exchange](extensions/sso-exchange/) | Endpoint | Native Apple & Google Sign-In for mobile apps |
 | [payments](extensions/payments/) | Endpoint | Payment integration (PayTR, iyzico, Stripe) |
 | [subscription-lifecycle](extensions/subscription-lifecycle/) | Hook | Daily sweep: warns before expiry, downgrades lapsed accounts |
@@ -22,7 +23,11 @@ initContainers:
       - sh
       - -c
       - |
-        mkdir -p /extensions/sso-exchange/dist /extensions/payments/dist /extensions/subscription-lifecycle/dist
+        mkdir -p /extensions/guest-auth/dist /extensions/sso-exchange/dist /extensions/payments/dist /extensions/subscription-lifecycle/dist
+        wget -O /extensions/guest-auth/dist/index.js \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/guest-auth/dist/index.js"
+        wget -O /extensions/guest-auth/package.json \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/guest-auth/package.json"
         wget -O /extensions/sso-exchange/dist/index.js \
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/sso-exchange/dist/index.js"
         wget -O /extensions/sso-exchange/package.json \

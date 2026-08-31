@@ -1,0 +1,28 @@
+{
+  "name": "guest-auth",
+  "version": "1.0.0",
+  "description": "Issues restricted Directus sessions for anonymous Delivr customers",
+  "type": "module",
+  "directus:extension": {
+    "type": "endpoint",
+    "path": "dist/index.js",
+    "source": "src/index.ts",
+    "host": "^11.0.0"
+  },
+  "scripts": {
+    "build": "bunx @directus/extensions-sdk build",
+    "dev": "bunx @directus/extensions-sdk build -w",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@directus/extensions-sdk": "^13.0.0",
+    "@types/jsonwebtoken": "^9.0.10",
+    "@types/node": "^25.9.1",
+    "typescript": "^5.0.0"
+  },
+  "dependencies": {
+    "jsonwebtoken": "^9.0.3",
+    "nanoid": "^3.3.11"
+  },
+  "license": "MIT"
+}
