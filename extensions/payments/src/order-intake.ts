@@ -1,5 +1,7 @@
 import type { Request, Response, Router } from "express";
 
+import { calculateMarketplaceSettlement } from "./marketplace-finance.js";
+
 const ORDER_SOURCES = [
   "qr_table",
   "direct",
@@ -13,14 +15,14 @@ const ORDER_SOURCES = [
 
 type OrderSource = (typeof ORDER_SOURCES)[number];
 
-const CUSTOMER_SOURCES = new Set<OrderSource>(["qr_table", "whatsapp"]);
+const CUSTOMER_SOURCES = new Set<OrderSource>(["qr_table", "direct", "whatsapp"]);
+const AUTHENTICATED_CUSTOMER_SOURCES = new Set<OrderSource>(["direct"]);
 const BUSINESS_COLLECTED_SOURCES = new Set<OrderSource>([
   "qr_table",
   "whatsapp",
   "direct",
 ]);
 const BUSINESS_ONLY_SOURCES = new Set<OrderSource>([
-  "direct",
   "trendyol_go",
   "yemek_sepeti",
   "getir",
@@ -44,6 +46,7 @@ export interface OrderIntakeInput {
   customer_name: string | null;
   customer_phone: string | null;
   note: string | null;
+  payment_method: "online" | "cash" | "card" | null;
   order_items: OrderLineInput[];
 }
 
@@ -114,10 +117,24 @@ interface ProductRecord {
   status: string;
   isStockTracked: boolean;
   stockQuantity: number | null;
+  vatRateBps: number | null;
 }
 
 interface QuotedLine extends OrderLineInput {
   unit_price: number;
+  unit_price_minor: number;
+  line_subtotal_minor: number;
+  vat_rate_bps: number;
+  vat_amount_minor: number;
+  is_discounted: boolean;
+}
+
+export interface VenuePaymentSettings {
+  acceptsOnlinePayment: boolean;
+  acceptsCashOnDelivery: boolean;
+  acceptsCardOnDelivery: boolean;
+  onlinePaymentFeatureEnabled: boolean;
+  paytrMarketplaceStatus: string;
 }
 
 interface OrderResult {
@@ -290,6 +307,29 @@ export function parseOrderIntakeInput(body: unknown): OrderIntakeInput {
     );
   }
 
+  const requestedPaymentMethod = body.payment_method;
+  let paymentMethod: OrderIntakeInput["payment_method"] = null;
+  if (requestedPaymentMethod != null) {
+    if (
+      typeof requestedPaymentMethod !== "string" ||
+      !["online", "cash", "card"].includes(requestedPaymentMethod)
+    ) {
+      throw new OrderIntakeError(
+        422,
+        "INVALID_PAYMENT_METHOD",
+        "payment_method is not supported",
+      );
+    }
+    paymentMethod = requestedPaymentMethod as "online" | "cash" | "card";
+  }
+  if (source === "direct" && paymentMethod === null) {
+    throw new OrderIntakeError(
+      422,
+      "PAYMENT_METHOD_REQUIRED",
+      "Direct orders require a payment method",
+    );
+  }
+
   return {
     client_request_id: body.client_request_id,
     venue_id: venueId,
@@ -299,6 +339,7 @@ export function parseOrderIntakeInput(body: unknown): OrderIntakeInput {
     customer_name: customerName,
     customer_phone: optionalText(body.customer_phone, "customer_phone", 32),
     note: optionalText(body.note, "note", 1000),
+    payment_method: paymentMethod,
     order_items: orderItems,
   };
 }
@@ -336,12 +377,36 @@ function toProduct(record: Record<string, unknown>): ProductRecord {
     status: String(record.status ?? ""),
     isStockTracked: record.is_stock_tracked === true,
     stockQuantity: stockQuantity === null ? null : Math.trunc(stockQuantity),
+    vatRateBps: nullableNumber(record.vat_rate_bps),
   };
+}
+
+export function assertPaymentMethodAvailable(
+  paymentMethod: "online" | "cash" | "card",
+  settings: VenuePaymentSettings,
+): void {
+  const available =
+    paymentMethod === "online"
+      ? settings.acceptsOnlinePayment &&
+        settings.onlinePaymentFeatureEnabled &&
+        settings.paytrMarketplaceStatus === "approved"
+      : paymentMethod === "cash"
+        ? settings.acceptsCashOnDelivery
+        : settings.acceptsCardOnDelivery;
+  if (!available) {
+    throw new OrderIntakeError(
+      422,
+      "PAYMENT_METHOD_UNAVAILABLE",
+      "The restaurant is not accepting the selected payment method",
+    );
+  }
 }
 
 export function quoteOrderLines(
   input: OrderIntakeInput,
   products: ProductRecord[],
+  defaultVatRateBps = 0,
+  discountedPrices: ReadonlyMap<number, number> = new Map(),
 ): {
   lines: QuotedLine[];
   totalMinor: number;
@@ -364,17 +429,12 @@ export function quoteOrderLines(
         `Product ${line.product_id} is unavailable`,
       );
     }
-    if (
-      product.isStockTracked &&
-      (product.stockQuantity ?? 0) < line.quantity
-    ) {
-      throw new OrderIntakeError(
-        409,
-        "INSUFFICIENT_STOCK",
-        `Product ${line.product_id} has insufficient stock`,
-      );
-    }
-    const unitMinor = Math.round(product.price * 100);
+    const discountedPrice = discountedPrices.get(product.id);
+    const effectivePrice =
+      discountedPrice !== undefined && discountedPrice >= 0 && discountedPrice < product.price
+        ? discountedPrice
+        : product.price;
+    const unitMinor = Math.round(effectivePrice * 100);
     totalMinor += unitMinor * line.quantity;
     if (!Number.isSafeInteger(totalMinor)) {
       throw new OrderIntakeError(
@@ -383,7 +443,22 @@ export function quoteOrderLines(
         "Order total is too large",
       );
     }
-    return { ...line, unit_price: unitMinor / 100 };
+    const lineSubtotalMinor = unitMinor * line.quantity;
+    const vatRateBps = product.vatRateBps ?? defaultVatRateBps;
+    if (!Number.isInteger(vatRateBps) || vatRateBps < 0 || vatRateBps > 10_000) {
+      throw new OrderIntakeError(422, "INVALID_VAT_RATE", "Product VAT rate is invalid");
+    }
+    return {
+      ...line,
+      unit_price: unitMinor / 100,
+      unit_price_minor: unitMinor,
+      line_subtotal_minor: lineSubtotalMinor,
+      vat_rate_bps: vatRateBps,
+      vat_amount_minor: Math.round(
+        (lineSubtotalMinor * vatRateBps) / (10_000 + vatRateBps),
+      ),
+      is_discounted: effectivePrice < product.price,
+    };
   });
   return { lines, totalMinor };
 }
@@ -417,6 +492,7 @@ function assertSameIdempotentRequest(
     normalizeComparableText(existing.customer_name) === input.customer_name &&
     normalizeComparableText(existing.customer_phone) === input.customer_phone &&
     normalizeComparableText(existing.note) === input.note &&
+    normalizeComparableText(existing.payment_method) === input.payment_method &&
     JSON.stringify(storedLines) === JSON.stringify(requestedLines);
   if (!matches) {
     throw new OrderIntakeError(
@@ -430,6 +506,8 @@ function assertSameIdempotentRequest(
 async function loadQuote(
   ProductsService: ItemsServiceLike,
   input: OrderIntakeInput,
+  defaultVatRateBps = 0,
+  CampaignProductsService?: ItemsServiceLike,
 ): Promise<{ lines: QuotedLine[]; totalMinor: number }> {
   const products = await ProductsService.readByQuery({
     filter: {
@@ -446,10 +524,112 @@ async function loadQuote(
       "status",
       "is_stock_tracked",
       "stock_quantity",
+      "vat_rate_bps",
     ],
     limit: -1,
   });
-  return quoteOrderLines(input, products.map(toProduct));
+  const productRecords = products.map(toProduct);
+  const baseQuote = quoteOrderLines(input, productRecords, defaultVatRateBps);
+  if (!CampaignProductsService) return baseQuote;
+  const now = new Date();
+  const campaignProducts = await CampaignProductsService.readByQuery({
+    filter: {
+      _and: [
+        { product_id: { _in: input.order_items.map((line) => line.product_id) } },
+        { campaign_id: { campaign_status: { _eq: "active" } } },
+        { campaign_id: { start_datetime: { _lte: now.toISOString() } } },
+        { campaign_id: { end_datetime: { _gte: now.toISOString() } } },
+      ],
+    },
+    fields: [
+      "product_id",
+      "discounted_price",
+      "campaign_id.campaign_status",
+      "campaign_id.start_datetime",
+      "campaign_id.end_datetime",
+      "campaign_id.minimum_order_amount",
+      "campaign_id.schedule_type",
+      "campaign_id.schedule_days",
+      "campaign_id.daily_start_time",
+      "campaign_id.daily_end_time",
+    ],
+    limit: -1,
+  });
+  const discountedPrices = activeDiscountedPrices(
+    campaignProducts,
+    baseQuote.totalMinor / 100,
+    now,
+  );
+  return quoteOrderLines(input, productRecords, defaultVatRateBps, discountedPrices);
+}
+
+const WEEKDAYS = [
+  "sunday",
+  "monday",
+  "tuesday",
+  "wednesday",
+  "thursday",
+  "friday",
+  "saturday",
+] as const;
+
+function timeMinutes(value: unknown): number | null {
+  const match = /^(\d{1,2}):(\d{2})/.exec(String(value ?? ""));
+  if (!match) return null;
+  const hours = Number(match[1]);
+  const minutes = Number(match[2]);
+  return hours <= 23 && minutes <= 59 ? hours * 60 + minutes : null;
+}
+
+export function activeDiscountedPrices(
+  rows: Record<string, unknown>[],
+  baseSubtotal: number,
+  now: Date,
+): Map<number, number> {
+  const prices = new Map<number, number>();
+  for (const row of rows) {
+    const campaign = isRecord(row.campaign_id) ? row.campaign_id : null;
+    const productId = relatedId(row.product_id);
+    const price = nullableNumber(row.discounted_price);
+    if (!campaign || !productId || price === null || price < 0) continue;
+    const start = Date.parse(String(campaign.start_datetime ?? ""));
+    const end = Date.parse(String(campaign.end_datetime ?? ""));
+    const minimum = Number(campaign.minimum_order_amount ?? 0);
+    if (
+      campaign.campaign_status !== "active" ||
+      !Number.isFinite(start) ||
+      !Number.isFinite(end) ||
+      now.getTime() < start ||
+      now.getTime() > end ||
+      !Number.isFinite(minimum) ||
+      baseSubtotal < Math.max(0, minimum)
+    ) {
+      continue;
+    }
+    const scheduleType = String(campaign.schedule_type ?? "once");
+    if (scheduleType !== "once") {
+      const startMinutes = timeMinutes(campaign.daily_start_time);
+      const endMinutes = timeMinutes(campaign.daily_end_time);
+      if (startMinutes === null || endMinutes === null) continue;
+      const currentMinutes = now.getHours() * 60 + now.getMinutes();
+      const crossesMidnight = endMinutes < startMinutes;
+      const timeMatches = crossesMidnight
+        ? currentMinutes >= startMinutes || currentMinutes <= endMinutes
+        : currentMinutes >= startMinutes && currentMinutes <= endMinutes;
+      if (!timeMatches) continue;
+      if (scheduleType === "weekly") {
+        const scheduleDate = new Date(now);
+        if (crossesMidnight && currentMinutes <= endMinutes) {
+          scheduleDate.setDate(scheduleDate.getDate() - 1);
+        }
+        const days = Array.isArray(campaign.schedule_days) ? campaign.schedule_days : [];
+        if (!days.includes(WEEKDAYS[scheduleDate.getDay()])) continue;
+      }
+    }
+    const current = prices.get(productId);
+    if (current === undefined || price < current) prices.set(productId, price);
+  }
+  return prices;
 }
 
 async function assertVenueAccess(
@@ -457,10 +637,23 @@ async function assertVenueAccess(
   userId: string | null,
   VenuesService: ItemsServiceLike,
   UsersService: UsersServiceLike,
-): Promise<void> {
+): Promise<Record<string, unknown>> {
   const venues = await VenuesService.readByQuery({
     filter: { id: { _eq: input.venue_id } },
-    fields: ["id", "status", "is_visible", "approval_status"],
+    fields: [
+      "id",
+      "status",
+      "is_visible",
+      "approval_status",
+      "delivery_fee",
+      "has_free_delivery",
+      "default_vat_rate_bps",
+      "accepts_online_payment",
+      "accepts_cash_on_delivery",
+      "accepts_card_on_delivery",
+      "online_payment_feature_enabled",
+      "paytr_marketplace_status",
+    ],
     limit: 1,
   });
   const venue = venues[0];
@@ -470,7 +663,15 @@ async function assertVenueAccess(
 
   if (BUSINESS_ONLY_SOURCES.has(input.order_source)) {
     await assertBusinessVenueAccess(input, userId, UsersService);
-    return;
+    return venue;
+  }
+
+  if (AUTHENTICATED_CUSTOMER_SOURCES.has(input.order_source) && !userId) {
+    throw new OrderIntakeError(
+      401,
+      "AUTHENTICATION_REQUIRED",
+      "Authentication is required",
+    );
   }
 
   if (
@@ -484,6 +685,110 @@ async function assertVenueAccess(
       "Venue is not accepting customer orders",
     );
   }
+  if (input.payment_method !== null) {
+    assertPaymentMethodAvailable(input.payment_method, {
+      acceptsOnlinePayment: venue.accepts_online_payment === true,
+      acceptsCashOnDelivery: venue.accepts_cash_on_delivery !== false,
+      acceptsCardOnDelivery: venue.accepts_card_on_delivery !== false,
+      onlinePaymentFeatureEnabled: venue.online_payment_feature_enabled === true,
+      paytrMarketplaceStatus: String(venue.paytr_marketplace_status ?? "pending"),
+    });
+  }
+  return venue;
+}
+
+interface MarketplaceTerms {
+  defaultFoodVatBps: number;
+  commissionRateBps: number;
+  commissionVatRateBps: number;
+  withholdingRateBps: number;
+}
+
+function configuredRate(value: unknown, field: string): number {
+  const rate = Number(value);
+  if (!Number.isInteger(rate) || rate < 0 || rate > 10_000) {
+    throw new OrderIntakeError(
+      503,
+      "ONLINE_PAYMENT_CONFIGURATION_MISSING",
+      `${field} is not configured`,
+    );
+  }
+  return rate;
+}
+
+async function loadMarketplaceTerms(
+  venueId: number,
+  CommissionTerms: ItemsServiceLike,
+  FiscalConfigurations: ItemsServiceLike,
+): Promise<MarketplaceTerms> {
+  const now = new Date().toISOString();
+  const [terms, configurations] = await Promise.all([
+    CommissionTerms.readByQuery({
+      filter: {
+        _and: [
+          { venue_id: { _eq: venueId } },
+          { term_status: { _eq: "active" } },
+          { effective_from: { _lte: now } },
+          {
+            _or: [
+              { effective_until: { _null: true } },
+              { effective_until: { _gt: now } },
+            ],
+          },
+        ],
+      },
+      fields: ["commission_bps", "commission_vat_bps"],
+      sort: ["-effective_from"],
+      limit: 1,
+    }),
+    FiscalConfigurations.readByQuery({
+      filter: {
+        _and: [
+          { configuration_status: { _eq: "active" } },
+          { effective_from: { _lte: now } },
+          {
+            _or: [
+              { effective_until: { _null: true } },
+              { effective_until: { _gt: now } },
+            ],
+          },
+        ],
+      },
+      fields: ["default_food_vat_bps", "withholding_bps"],
+      sort: ["-effective_from"],
+      limit: 1,
+    }),
+  ]);
+  const term = terms[0];
+  const fiscal = configurations[0];
+  if (!term || !fiscal) {
+    throw new OrderIntakeError(
+      503,
+      "ONLINE_PAYMENT_CONFIGURATION_MISSING",
+      "Active marketplace financial terms are required",
+    );
+  }
+  return {
+    defaultFoodVatBps: configuredRate(
+      fiscal.default_food_vat_bps,
+      "default_food_vat_bps",
+    ),
+    commissionRateBps: configuredRate(term.commission_bps, "commission_bps"),
+    commissionVatRateBps: configuredRate(
+      fiscal.commission_vat_bps,
+      "commission_vat_bps",
+    ),
+    withholdingRateBps: configuredRate(fiscal.withholding_bps, "withholding_bps"),
+  };
+}
+
+function deliveryFeeMinor(input: OrderIntakeInput, venue: Record<string, unknown>): number {
+  if (input.order_source !== "direct" || venue.has_free_delivery === true) return 0;
+  const amount = Number(venue.delivery_fee ?? 0);
+  if (!Number.isFinite(amount) || amount < 0) {
+    throw new OrderIntakeError(422, "INVALID_TOTAL", "Delivery fee is invalid");
+  }
+  return Math.round(amount * 100);
 }
 
 async function assertBusinessVenueAccess(
@@ -552,7 +857,8 @@ async function completeExistingOrder(
     limit: -1,
   });
   assertSameIdempotentRequest(existing, existingLines, input);
-  const paymentNeeded = BUSINESS_COLLECTED_SOURCES.has(input.order_source);
+  const paymentNeeded =
+    BUSINESS_COLLECTED_SOURCES.has(input.order_source) && input.payment_method !== "online";
   const payments = paymentNeeded
     ? await services.OrderPayments.readByQuery({
         filter: { order_id: { _eq: orderId } },
@@ -612,7 +918,7 @@ async function completeExistingOrder(
     await services.OrderPayments.createOne({
       order_id: orderId,
       payment_status: "pending",
-      payment_method: null,
+      payment_method: input.payment_method,
       amount_minor: quote.totalMinor,
       currency: "TRY",
     });
@@ -650,9 +956,22 @@ async function createAtomicOrder(
       "order_payments",
       options,
     );
+    const OnlineOrderPayments = new context.services.ItemsService(
+      "online_order_payments",
+      options,
+    );
     const Products = new context.services.ItemsService("products", options);
+    const CampaignProducts = new context.services.ItemsService("campaign_products", options);
     const Venues = new context.services.ItemsService("venues", options);
     const Tables = new context.services.ItemsService("venue_tables", options);
+    const CommissionTerms = new context.services.ItemsService(
+      "venue_commission_terms",
+      options,
+    );
+    const FiscalConfigurations = new context.services.ItemsService(
+      "fiscal_configurations",
+      options,
+    );
     const Users = new context.services.UsersService(options);
 
     const existingOrders = await Orders.readByQuery({
@@ -666,6 +985,7 @@ async function createAtomicOrder(
         "customer_name",
         "customer_phone",
         "note",
+        "payment_method",
         "total_amount",
         "order_status",
       ],
@@ -687,9 +1007,39 @@ async function createAtomicOrder(
       });
     }
 
-    await assertVenueAccess(input, userId, Venues, Users);
+    const venue = await assertVenueAccess(input, userId, Venues, Users);
     await assertTable(input, Tables);
-    const quote = await loadQuote(Products, input);
+    const marketplaceTerms =
+      input.payment_method === "online"
+        ? await loadMarketplaceTerms(
+            input.venue_id,
+            CommissionTerms,
+            FiscalConfigurations,
+          )
+        : null;
+    const defaultVatRateBps =
+      nullableNumber(venue.default_vat_rate_bps) ??
+      marketplaceTerms?.defaultFoodVatBps ??
+      0;
+    const quote = await loadQuote(Products, input, defaultVatRateBps, CampaignProducts);
+    const orderDeliveryFeeMinor = deliveryFeeMinor(input, venue);
+    const totalMinor = quote.totalMinor + orderDeliveryFeeMinor;
+    if (!Number.isSafeInteger(totalMinor)) {
+      throw new OrderIntakeError(422, "INVALID_TOTAL", "Order total is too large");
+    }
+    const settlement = marketplaceTerms
+      ? calculateMarketplaceSettlement({
+          foodSubtotalMinor: quote.totalMinor,
+          deliveryFeeMinor: orderDeliveryFeeMinor,
+          commissionRateBps: marketplaceTerms.commissionRateBps,
+          commissionVatRateBps: marketplaceTerms.commissionVatRateBps,
+          withholdingRateBps: marketplaceTerms.withholdingRateBps,
+          vatBreakdown: quote.lines.map((line) => ({
+            grossMinor: line.line_subtotal_minor,
+            vatRateBps: line.vat_rate_bps,
+          })),
+        })
+      : null;
 
     const createdId = await Orders.createOne({
       client_request_id: input.client_request_id,
@@ -701,8 +1051,12 @@ async function createAtomicOrder(
       customer_phone: input.customer_phone,
       note: input.note,
       user_id: CUSTOMER_SOURCES.has(input.order_source) ? userId : null,
-      order_status: "pending",
-      total_amount: quote.totalMinor / 100,
+      order_status: input.payment_method === "online" ? "awaiting_payment" : "pending",
+      payment_method: input.payment_method,
+      subtotal_minor: quote.totalMinor,
+      delivery_fee_minor: orderDeliveryFeeMinor,
+      total_amount_minor: totalMinor,
+      total_amount: totalMinor / 100,
     });
     const orderId = numericId(createdId, "order.id");
 
@@ -712,16 +1066,49 @@ async function createAtomicOrder(
         product_id: line.product_id,
         quantity: line.quantity,
         unit_price: line.unit_price,
-        is_discounted: false,
+        unit_price_minor: line.unit_price_minor,
+        line_subtotal_minor: line.line_subtotal_minor,
+        vat_rate_bps: line.vat_rate_bps,
+        vat_amount_minor: line.vat_amount_minor,
+        is_discounted: line.is_discounted,
       })),
     );
 
-    if (BUSINESS_COLLECTED_SOURCES.has(input.order_source)) {
+    if (settlement) {
+      if (!userId) {
+        throw new OrderIntakeError(
+          401,
+          "AUTHENTICATION_REQUIRED",
+          "Authentication is required",
+        );
+      }
+      await OnlineOrderPayments.createOne({
+        order_id: orderId,
+        venue_id: input.venue_id,
+        user_id: userId,
+        payment_status: "pending",
+        amount_minor: totalMinor,
+        refunded_amount_minor: 0,
+        currency: "TRY",
+        food_subtotal_minor: quote.totalMinor,
+        delivery_fee_minor: orderDeliveryFeeMinor,
+        food_vat_minor: settlement.foodVatMinor,
+        commission_minor: settlement.commissionMinor,
+        commission_vat_minor: settlement.commissionVatMinor,
+        withholding_minor: settlement.withholdingMinor,
+        venue_net_minor: settlement.venuePayoutMinor,
+      });
+    }
+
+    if (
+      BUSINESS_COLLECTED_SOURCES.has(input.order_source) &&
+      input.payment_method !== "online"
+    ) {
       await OrderPayments.createOne({
         order_id: orderId,
         payment_status: "pending",
-        payment_method: null,
-        amount_minor: quote.totalMinor,
+        payment_method: input.payment_method,
+        amount_minor: totalMinor,
         currency: "TRY",
       });
     }
@@ -731,8 +1118,8 @@ async function createAtomicOrder(
       client_request_id: input.client_request_id,
       order: {
         id: orderId,
-        order_status: "pending",
-        total_amount: quote.totalMinor / 100,
+        order_status: input.payment_method === "online" ? "awaiting_payment" : "pending",
+        total_amount: totalMinor / 100,
       },
     };
   });

@@ -1,6 +1,6 @@
 # Payments Extension
 
-Directus endpoint extension for subscription payments. Currently supports [PayTR](https://www.paytr.com) with a provider-agnostic interface ready for iyzico, Stripe, and others.
+Directus endpoint extension for subscription payments and isolated PayTR marketplace order payments.
 
 ## Endpoints
 
@@ -10,6 +10,16 @@ Directus endpoint extension for subscription payments. Currently supports [PayTR
 | `GET` | `/payments/check-status` | Required | Check payment status via provider API |
 | `POST` | `/payments/callback` | Public | Webhook called by payment provider |
 | `POST` | `/payments/orders` | Conditional | Atomically create an idempotent Delivr order |
+| `POST` | `/payments/orders/:id/payment-attempts` | Customer | Reconcile the previous attempt and create a 15-minute PayTR iFrame attempt |
+| `GET` | `/payments/orders/:id/payment-status` | Customer | Return verified payment, acceptance, retry, and delivery-code state |
+| `POST` | `/payments/paytr/callback` | Public | Verify the order callback HMAC, amount, currency, and status query |
+| `POST` | `/payments/orders/:id/accept` | Restaurant | Accept a paid order within five minutes |
+| `POST` | `/payments/orders/:id/cancel` | Customer or restaurant | Cancel before preparation and fully refund captured funds |
+| `POST` | `/payments/orders/:id/refunds` | Admin | Issue an amount or item-based partial refund |
+| `POST` | `/payments/orders/:id/delivery-verification` | Restaurant | Verify the rate-limited six-digit delivery code |
+| `POST` | `/payments/payouts/:id/transfers` | Admin | Submit an eligible PayTR platform transfer instruction |
+| `POST` | `/payments/venues/:id/payment-account` | Restaurant or admin | Submit encrypted payout-account details and payment preferences |
+| `POST` | `/payments/venues/:id/payment-account/review` | Admin | Approve, reject, or suspend a submerchant account |
 | `GET` | `/payments/ok` | Public | Browser redirect after successful payment |
 | `GET` | `/payments/fail` | Public | Browser redirect after failed payment |
 
@@ -147,6 +157,23 @@ Set these on your Directus instance. Provider credentials stay provider-specific
 | `PAYMENTS_APP_URL` | No | Web app URL for redirects (default: `http://localhost:8081`) |
 | `BUSINESS_ROLE_ID` | Yes | Directus role ID granted on successful payment |
 | `SSO_DEFAULT_ROLE_ID` | Yes | Directus role ID restored on cancellation (shared with `sso-exchange`) |
+
+### Marketplace order payments
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `PAYTR_ORDER_CALLBACK_URL` | Yes | Full URL to `/payments/paytr/callback` |
+| `PAYTR_ORDER_OK_URL` | Yes | App URL for the verification-only redirect screen |
+| `PAYTR_ORDER_FAIL_URL` | Yes | App URL for failed or abandoned hosted payment |
+| `PAYTR_ORDER_TEST_MODE` | No | `1` in PayTR test mode, default `0` |
+| `PAYMENT_DELIVERY_CODE_PEPPER` | Yes | Secret used to derive and hash order-specific delivery codes |
+| `PAYMENT_ACCOUNT_ENCRYPTION_KEY` | Yes | Base64-encoded 32-byte AES-256-GCM key for payout IBANs |
+| `MARKETPLACE_LIFECYCLE_ACTOR_ID` | Yes for automatic payouts | Delivr administrator user used by the scheduled transfer command |
+| `MARKETPLACE_LIFECYCLE_CRON` | No | Marketplace hook schedule, default every minute |
+
+Marketplace amounts are stored as integer minor units. Card data, PayTR credentials, plaintext
+delivery codes, and plaintext IBANs are never persisted. Subscription rows and order-payment rows
+remain separate even though they use the same provider credentials.
 
 > **Security:** Merchant keys and salts are secrets. Never expose them client-side.
 

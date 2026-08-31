@@ -9,6 +9,7 @@ Open-source Directus extensions by [DemirTech](https://demirtech.com).
 | [sso-exchange](extensions/sso-exchange/) | Endpoint | Native Apple & Google Sign-In for mobile apps |
 | [payments](extensions/payments/) | Endpoint | Payment integration (PayTR, iyzico, Stripe) |
 | [subscription-lifecycle](extensions/subscription-lifecycle/) | Hook | Daily sweep: warns before expiry, downgrades lapsed accounts |
+| [marketplace-lifecycle](extensions/marketplace-lifecycle/) | Hook | PayTR order reconciliation, timeout refunds, and payouts |
 
 ## Usage with Kubernetes
 
@@ -22,7 +23,7 @@ initContainers:
       - sh
       - -c
       - |
-        mkdir -p /extensions/sso-exchange/dist /extensions/payments/dist /extensions/subscription-lifecycle/dist
+        mkdir -p /extensions/sso-exchange/dist /extensions/payments/dist /extensions/subscription-lifecycle/dist /extensions/marketplace-lifecycle/dist
         wget -O /extensions/sso-exchange/dist/index.js \
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/sso-exchange/dist/index.js"
         wget -O /extensions/sso-exchange/package.json \
@@ -35,6 +36,10 @@ initContainers:
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/subscription-lifecycle/dist/index.js"
         wget -O /extensions/subscription-lifecycle/package.json \
           "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/subscription-lifecycle/package.json"
+        wget -O /extensions/marketplace-lifecycle/dist/index.js \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/marketplace-lifecycle/dist/index.js"
+        wget -O /extensions/marketplace-lifecycle/package.json \
+          "https://raw.githubusercontent.com/demirtechcom/directus-extensions/main/extensions/marketplace-lifecycle/package.json"
     volumeMounts:
       - name: extensions
         mountPath: /extensions
@@ -52,9 +57,9 @@ Mount the volume in the Directus container at `/directus/extensions`.
 
 ```bash
 cd extensions/<name>
-npm install
-npm run build    # builds dist/index.js
-npm run dev      # watch mode
+bun install
+bun run build    # builds dist/index.js
+bun run dev      # watch mode
 ```
 
 ## License
