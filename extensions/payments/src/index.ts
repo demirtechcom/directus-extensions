@@ -2,6 +2,8 @@ import type { Router } from "express";
 import crypto from "crypto";
 
 import { registerOrderIntake } from "./order-intake.js";
+import { createMarketplaceApplication } from "./marketplace-application.js";
+import { registerMarketplaceRoutes } from "./marketplace-routes.js";
 import {
   buildSubscriptionPayload,
   computeExpiry,
@@ -35,6 +37,7 @@ export default (router: Router, context: any) => {
   const DEFAULT_ROLE_ID = String(env["SSO_DEFAULT_ROLE_ID"] || "");
 
   registerOrderIntake(router, context);
+  registerMarketplaceRoutes(router, createMarketplaceApplication(context));
 
   // Logged at error level on purpose: a missing role id means paid users silently
   // keep their free-tier permissions, which is worse than a noisy boot.
