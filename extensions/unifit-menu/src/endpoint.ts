@@ -39,6 +39,9 @@ import {
 
 const DEFAULT_DAILY_LIMIT = 5;
 
+/** How long an `extracting` row counts against the limit before it is presumed abandoned. */
+const IN_FLIGHT_MS = 10 * 60 * 1000;
+
 const JPEG_RENDITION = {
   transformationParams: {
     format: "jpg",
@@ -98,16 +101,24 @@ export default (router: Router, context: any, deps: EndpointDeps = REAL_DEPS) =>
   }
 
   async function usedToday(user: string): Promise<number> {
-    const since = istanbulDayStart(deps.now());
-    // In-flight extractions count too: otherwise ten parallel uploads would all see zero and all
-    // run. One that later fails drops out again, which is what "failures don't count" means.
-    const row = await database(T.submissions)
+    const now = deps.now();
+    const since = istanbulDayStart(now);
+    const counted = await database(T.submissions)
       .where("user_created", user)
       .where("date_created", ">=", since)
-      .whereIn("status", [...COUNTED_STATUSES, STATUS.extracting])
+      .whereIn("status", COUNTED_STATUSES)
       .count({ n: "*" })
       .first();
-    return Number(row?.n ?? 0);
+    // In-flight extractions count too: otherwise ten parallel uploads would all see zero and all
+    // run. Only recent ones, though - a row whose pod was scaled away mid-call stays `extracting`
+    // forever, and must not eat the student's allowance for the rest of the day.
+    const inFlight = await database(T.submissions)
+      .where("user_created", user)
+      .where("date_created", ">=", new Date(Math.max(since.getTime(), now.getTime() - IN_FLIGHT_MS)))
+      .where("status", STATUS.extracting)
+      .count({ n: "*" })
+      .first();
+    return Number(counted?.n ?? 0) + Number(inFlight?.n ?? 0);
   }
 
   async function readFile(id: string, asJpeg: boolean): Promise<Buffer> {

@@ -139,6 +139,18 @@ describe("POST /submissions", () => {
     expect(retry.body.data.status).toBe(STATUS.extracting);
   });
 
+  it("stops counting an extraction abandoned more than ten minutes ago", async () => {
+    const limited = setup({ UNIFIT_MENU_DAILY_LIMIT: "1" });
+    limited.db.table(T.submissions).push({
+      id: "33333333-3333-4333-8333-333333333333",
+      user_created: USER,
+      date_created: new Date(NOW.getTime() - 11 * 60 * 1000),
+      status: STATUS.extracting,
+    });
+    const res = await limited.call("POST", "/submissions", { body: { file_ids: [FILE_A] } });
+    expect(res.body.data.status).toBe(STATUS.extracting);
+  });
+
   it("marks a result with no days as failed", async () => {
     t.extractMenu.mockImplementationOnce(async () => ({
       extraction: { ...EXTRACTION, days: [] },
