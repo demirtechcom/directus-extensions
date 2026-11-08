@@ -9,6 +9,7 @@ Open-source Directus extensions by [DemirTech](https://demirtech.com).
 | [sso-exchange](extensions/sso-exchange/) | Endpoint | Native Apple & Google Sign-In for mobile apps |
 | [payments](extensions/payments/) | Endpoint | Payment integration (PayTR, iyzico, Stripe) |
 | [subscription-lifecycle](extensions/subscription-lifecycle/) | Hook | Daily sweep: warns before expiry, downgrades lapsed accounts |
+| [unifit-menu](extensions/unifit-menu/) | Bundle | UNI FIT KYK menu submissions: Claude extraction and editor publishing |
 
 ## Usage with Kubernetes
 

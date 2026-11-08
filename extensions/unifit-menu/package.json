@@ -1,0 +1,43 @@
+{
+  "name": "unifit-menu",
+  "version": "1.0.0",
+  "description": "UNI FIT KYK menu submissions: AI extraction from uploaded menu files, and editor approval into zest_province_menus",
+  "type": "module",
+  "directus:extension": {
+    "type": "bundle",
+    "path": {
+      "app": "dist/app.js",
+      "api": "dist/api.js"
+    },
+    "entries": [
+      {
+        "type": "endpoint",
+        "name": "unifit-menu",
+        "source": "src/endpoint.ts"
+      },
+      {
+        "type": "hook",
+        "name": "unifit-menu-review",
+        "source": "src/review-hook.ts"
+      }
+    ],
+    "host": "^11.0.0"
+  },
+  "scripts": {
+    "build": "npx @directus/extensions-sdk build",
+    "test": "bun test src/__tests__",
+    "typecheck": "tsc --noEmit",
+    "dev": "npx @directus/extensions-sdk build -w"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "0.137.0",
+    "fflate": "0.8.2"
+  },
+  "devDependencies": {
+    "@directus/extensions-sdk": "^13.0.0",
+    "@types/express": "^5.0.0",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.0.0"
+  },
+  "license": "MIT"
+}
